@@ -37,32 +37,30 @@ cd dashboard-fiis
 ### 2. Crie e Ative um Ambiente Virtual (Recomendado)
 É uma boa prática usar um ambiente virtual para isolar as dependências do projeto:
 
-bash
-Copy
+```bash
 python -m venv venv
 # No Windows
 .\venv\Scripts\activate
 # No macOS/Linux
 source venv/bin/activate
-
+```
 
 ### 3. Instale as Dependências
 Instale todas as bibliotecas Python necessárias listadas no requirements.txt:
 
-bash
-Copy
+```bash
 pip install -r requirements.txt
-
+```
 
 ### 4. Configure as Variáveis de Ambiente
 Para proteger sua chave da API da Brapi, usaremos variáveis de ambiente.
 
 Crie o arquivo .env:
 Copie o arquivo de exemplo .env.example para um novo arquivo chamado .env na raiz do projeto:
-bash
-Copy
+```bash
 copy .env.example .env # No Windows
 cp .env.example .env   # No macOS/Linux
+```
 Obtenha sua chave da Brapi:
 Acesse o site da Brapi.
 Crie uma conta gratuita.
@@ -76,23 +74,23 @@ Importante: O arquivo .env está listado no .gitignore e NÃO DEVE SER COMMITADO
 ### 5. Execute o Dashboard
 Com todas as dependências instaladas e a API Key configurada, você pode iniciar o dashboard:
 
-bash
-Copy
+```bash
 streamlit run app.py
+```
 O Streamlit abrirá automaticamente o dashboard em seu navegador padrão (geralmente em http://localhost:8501).
 
-📁 Estrutura do Projeto
+```text
 dashboard-fiis/
-├── app.py                 # Código principal da aplicação Streamlit
-├── requirements.txt       # Lista de dependências do Python
-├── .env                   # Variáveis de ambiente (NÃO commitar no Git!)
-├── .env.example           # Exemplo de arquivo .env para configuração
-├── .gitignore             # Arquivos e pastas ignorados pelo Git
-├── data/                  # Pasta para armazenar dados locais
-│   ├── ifix_tickers.csv   # Lista de FIIs com preços e DY (atualizado pelo app)
-│   └── portfolio.json     # Dados da sua carteira de FIIs
-└── README.md              # Este arquivo
-
+├── app.py               # Código principal da aplicação Streamlit
+├── requirements.txt     # Lista de dependências do Python
+├── .env                 # Variáveis de ambiente (NÃO commitar no Git!)
+├── .env.example         # Exemplo de arquivo .env para configuração
+├── .gitignore           # Arquivos e pastas ignorados pelo Git
+├── data/                # Pasta para armazenar dados locais
+│   ├── ifix_tickers.csv # Lista de FIIs com preços e DY (atualizado pelo app)
+│   └── portfolio.json   # Dados da sua carteira de FIIs
+└── README.md            # Este arquivo
+```
 🛡️ Segurança e Boas Práticas
 Nunca commite o arquivo .env: Sua chave da API é um dado sensível. O .gitignore já está configurado para ignorá-lo.
 Mantenha suas dependências atualizadas: Periodicamente, execute pip install -r requirements.txt --upgrade para garantir que você está usando as versões mais recentes das bibliotecas.
