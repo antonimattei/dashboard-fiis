@@ -238,25 +238,85 @@ def get_dividends_12m(ticker):
     
     return 0.0
 
+# ============= LISTA DE FIIs CONHECIDOS (FALLBACK) =============
+
+FIIS_FALLBACK = [
+    "ALZR11","BCFF11","BRCR11","BTLG11","CVBI11","DEVA11","GALG11",
+    "GGRC11","HGBS11","HGCR11","HGFF11","HGLG11","HGPO11","HGRE11",
+    "HGRU11","HSML11","HTMX11","IRDM11","JSRE11","KNHY11","KNIP11",
+    "KNCR11","KNRI11","KNSC11","LVBI11","MALL11","MXRF11","PATL11",
+    "PVBI11","RBRF11","RBRP11","RBRY11","RBRR11","RECT11","RECR11",
+    "RNGO11","RURA11","RZTR11","SADI11","TGAR11","TRXF11","VGIR11",
+    "VIFI11","VILG11","VINO11","VISC11","VRTA11","XPCI11","XPLG11","XPML11",
+]
+
 # ============= FUNÇÕES DE PORTFOLIO =============
 
+@st.cache_data(ttl=60*60*12)  # Cache de 12 horas
+def _fetch_ifix_from_brapi():
+    """Busca lista de FIIs diretamente da Brapi."""
+    try:
+        response = client.quote.list()
+        fiis = []
+        for stock in response.stocks:
+            ticker = stock.stock
+            if ticker.endswith("11"):
+                fiis.append({
+                    "ticker": ticker.upper(),
+                    "nome": getattr(stock, "name", ticker),
+                    "tipo": getattr(stock, "type", "FII"),
+                })
+        if fiis:
+            logger.info("Lista Brapi: %d FIIs encontrados", len(fiis))
+            return fiis
+    except Exception as e:
+        logger.warning("Erro ao buscar lista da Brapi: %s", e)
+    return None
+
+
 def load_ifix_list():
-    """Carrega lista de FIIs do CSV"""
-    df = pd.read_csv(IFIX_CSV)
-    df["ticker"] = df["ticker"].str.upper().str.strip()
-    
-    # Garantir que as colunas de preço e DY existam
-    if "preco_atual" not in df.columns:
-        df["preco_atual"] = 0.0
-    if "dy_12m" not in df.columns:
-        df["dy_12m"] = 0.0
-    if "data_atualizacao" not in df.columns:
-        df["data_atualizacao"] = ""
-    
+    """
+    Carrega lista de FIIs com prioridade:
+    1. CSV em disco (cache local com preços/DY já preenchidos)
+    2. API Brapi (busca ao vivo)
+    3. Lista hardcoded (fallback offline)
+    """
+    # 1. Tenta CSV local
+    if os.path.exists(IFIX_CSV):
+        try:
+            df = pd.read_csv(IFIX_CSV)
+            df["ticker"] = df["ticker"].str.upper().str.strip()
+            if "preco_atual" not in df.columns:
+                df["preco_atual"] = 0.0
+            if "dy_12m" not in df.columns:
+                df["dy_12m"] = 0.0
+            if "data_atualizacao" not in df.columns:
+                df["data_atualizacao"] = ""
+            return df
+        except Exception as e:
+            logger.warning("CSV corrompido, recriando: %s", e)
+
+    # 2. Tenta Brapi
+    fiis = _fetch_ifix_from_brapi()
+
+    # 3. Fallback hardcoded
+    if not fiis:
+        logger.warning("Usando lista hardcoded de FIIs (fallback)")
+        fiis = [{"ticker": t, "nome": t, "tipo": "FII"} for t in FIIS_FALLBACK]
+
+    df = pd.DataFrame(fiis).sort_values("ticker").reset_index(drop=True)
+    df["preco_atual"] = 0.0
+    df["dy_12m"] = 0.0
+    df["data_atualizacao"] = ""
+
+    # Persiste o CSV para próximas execuções
+    save_ifix_list(df)
     return df
+
 
 def save_ifix_list(df):
     """Salva lista de FIIs no CSV com preços e DY atualizados"""
+    os.makedirs(DATA_DIR, exist_ok=True)
     df.to_csv(IFIX_CSV, index=False, encoding='utf-8')
 
 # ============= FUNÇÕES DE PROVENTOS =============
