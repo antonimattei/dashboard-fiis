@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 from dateutil.relativedelta import relativedelta
 from brapi import Brapi
 from dotenv import load_dotenv
@@ -205,6 +206,27 @@ def get_dy_12m_estimate(ticker):
     # Se não conseguir de nenhuma fonte, retorna None
     return None
 
+@st.cache_data(ttl=60*60*6)  # Cache de 6 horas
+def get_ifix_performance(period="1y"):
+    """Busca cotação histórica do IFIX via yfinance para comparativo"""
+    try:
+        ticker_ifix = yf.Ticker("IFIX11.SA")
+        hist = ticker_ifix.history(period=period)
+        if hist.empty:
+            logger.warning("IFIX11.SA sem dados no yfinance, tentando ^IFIX")
+            ticker_ifix = yf.Ticker("^IFIX")
+            hist = ticker_ifix.history(period=period)
+        if not hist.empty:
+            first = hist["Close"].iloc[0]
+            last = hist["Close"].iloc[-1]
+            pct = (last - first) / first * 100
+            logger.info("IFIX performance (%s): %.2f%%", period, pct)
+            return hist["Close"].reset_index(), pct
+    except Exception as e:
+        logger.warning("Erro ao buscar performance do IFIX: %s", e)
+    return None, None
+
+
 def get_dividends_12m(ticker):
     """Calcula dividendos anuais baseado no DY e preço atual"""
     price = get_last_price(ticker)
@@ -298,8 +320,12 @@ def upsert_position(portfolio, ticker, quantity, buy_price):
             if new_qty <= 0:
                 pos["quantity"] = 0
                 pos["avg_price"] = 0
+            elif quantity > 0:
+                # Compra: recalcula preço médio ponderado
+                pos["avg_price"] = (old_qty * old_pm + quantity * buy_price) / new_qty
+                pos["quantity"] = new_qty
             else:
-                pos["avg_price"] = (old_qty*old_pm + quantity*buy_price) / new_qty
+                # Venda parcial: PM não se altera
                 pos["quantity"] = new_qty
             return
     portfolio["positions"].append({"ticker": ticker, "quantity": quantity, "avg_price": buy_price})
@@ -553,6 +579,82 @@ def page_portfolio():
                 margin=dict(t=40, b=0, l=0, r=10),
             )
             st.plotly_chart(fig_bar, use_container_width=True)
+        # ---- Comparativo com IFIX ----
+        st.markdown("---")
+        st.subheader("📈 Comparativo vs IFIX")
+
+        period_map = {"1 mês": "1mo", "3 meses": "3mo", "6 meses": "6mo", "1 ano": "1y", "2 anos": "2y"}
+        period_label = st.selectbox("Período", list(period_map.keys()), index=3, key="ifix_period")
+        period_code = period_map[period_label]
+
+        with st.spinner("Buscando dados do IFIX..."):
+            hist_ifix, ifix_pct = get_ifix_performance(period_code)
+
+        # Rentabilidade da carteira no período: usa variação média ponderada (Preço Atual vs PM)
+        total_mercado = df["Valor de Mercado"].sum()
+        if total_mercado > 0:
+            df["_peso"] = df["Valor de Mercado"] / total_mercado
+            carteira_pct = (df["Variação (%)"] * df["_peso"]).sum()
+        else:
+            carteira_pct = 0.0
+
+        col_c1, col_c2, col_c3 = st.columns(3)
+        col_c1.metric("📊 Sua carteira (vs PM)", f"{carteira_pct:+.2f}%")
+        if ifix_pct is not None:
+            diff = carteira_pct - ifix_pct
+            col_c2.metric(f"📉 IFIX ({period_label})", f"{ifix_pct:+.2f}%")
+            col_c3.metric("⚖️ Alpha (carteira − IFIX)", f"{diff:+.2f}%", delta_color="normal")
+        else:
+            col_c2.metric(f"📉 IFIX ({period_label})", "Indisponível")
+            col_c3.metric("⚖️ Alpha", "—")
+
+        if hist_ifix is not None and not hist_ifix.empty:
+            hist_ifix_norm = hist_ifix.copy()
+            hist_ifix_norm["IFIX (base 100)"] = hist_ifix_norm["Close"] / hist_ifix_norm["Close"].iloc[0] * 100
+
+            fig_comp = go.Figure()
+            fig_comp.add_trace(go.Scatter(
+                x=hist_ifix_norm["Date"],
+                y=hist_ifix_norm["IFIX (base 100)"],
+                name="IFIX",
+                line=dict(color="darkorange", width=2),
+                hovertemplate="<b>IFIX</b><br>%{x}<br>Base 100: %{y:.1f}<extra></extra>",
+            ))
+            # Linha da carteira como valor constante (variação acumulada desde PM)
+            if len(hist_ifix_norm) >= 2:
+                carteira_base100 = 100 + carteira_pct
+                fig_comp.add_hline(
+                    y=carteira_base100,
+                    line_dash="dash",
+                    line_color="royalblue",
+                    annotation_text=f"Sua carteira: {carteira_base100:.1f}",
+                    annotation_position="right",
+                )
+            fig_comp.update_layout(
+                title=f"IFIX — últimos {period_label} (base 100)",
+                xaxis=dict(title="Data"),
+                yaxis=dict(title="Base 100"),
+                height=350,
+                margin=dict(t=40, b=0, l=0, r=10),
+            )
+            st.plotly_chart(fig_comp, use_container_width=True)
+            st.caption("⚠️ Rentabilidade da carteira calculada com base no preço médio de compra (PM). IFIX via yfinance.")
+
+        # ---- Exportação CSV ----
+        st.markdown("---")
+        st.subheader("⬇️ Exportar Carteira")
+
+        df_export = df.drop(columns=["_peso"], errors="ignore").copy()
+        df_export["Data exportação"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        csv_bytes = df_export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button(
+            label="📥 Baixar carteira em CSV",
+            data=csv_bytes,
+            file_name=f"carteira_fiis_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+        )
+
     else:
         st.info("📭 Sua carteira está vazia. Adicione FIIs na aba 'Explorar FIIs'.")
 
