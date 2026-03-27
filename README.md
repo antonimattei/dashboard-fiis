@@ -1,105 +1,141 @@
-# 📊 Dashboard FIIs IFIX
+# 📊 Dashboard Invest BR
 
-Um dashboard interativo em Streamlit para gerenciar e analisar investimentos em Fundos de Investimento Imobiliário (FIIs) brasileiros listados no índice IFIX. Este projeto visa fornecer uma ferramenta completa para acompanhar sua carteira, explorar novos FIIs e projetar sua jornada rumo à independência financeira.
+Dashboard interativo em Streamlit para gerenciar e analisar investimentos brasileiros: **FIIs, Ações e ETFs**. Acompanhe sua carteira, explore ativos, registre proventos e projete sua jornada rumo à independência financeira.
+
+---
 
 ## ✨ Funcionalidades
 
--   **Exploração de FIIs**: Visualize uma lista completa de FIIs do IFIX, com preços atualizados e Dividend Yield (DY) de 12 meses.
--   **Gestão de Carteira**: Adicione, remova e atualize suas posições em FIIs, registrando quantidade e preço médio de compra.
--   **Métricas da Carteira**: Acompanhe o valor de mercado total, a renda mensal estimada e o DY médio da sua carteira.
--   **Projeções de Independência Financeira**: Simule cenários de crescimento de patrimônio e renda passiva com base em aportes, valorização e crescimento de dividendos, com explicações detalhadas.
--   **Persistência de Dados**: Os dados da sua carteira e as métricas dos FIIs explorados são salvos localmente, garantindo que suas informações não se percam entre as sessões.
+- **Explorar Ativos** — lista completa de FIIs, Ações e ETFs com preços em tempo real e Dividend Yield (DY) de 12 meses; busca por ticker ou nome; filtro por tipo
+- **Minha Carteira** — adicione e gerencie posições com cálculo automático de preço médio; alertas de DY configuráveis; alocação por ativo e por tipo; comparativo vs IFIX ou Ibovespa; exportação CSV
+- **Resumo Fiscal** — ganho de capital latente e IR estimado por tipo de ativo (FII 20%, Ações 15%, ETFs 15%)
+- **Histórico de Proventos** — registro de dividendos/rendimentos recebidos com gráfico mensal e exportação CSV
+- **Projeções de IF** — simulação de crescimento de patrimônio e renda passiva com horizonte configurável de até 50 anos
 
-## 🚀 Tecnologias Utilizadas
+---
 
--   **Python**: Linguagem de programação principal.
--   **Streamlit**: Framework para construção rápida da interface web interativa.
--   **Pandas**: Manipulação e análise de dados.
--   **Plotly**: Geração de gráficos interativos para visualizações.
--   **Brapi**: API para obtenção de preços de FIIs.
--   **BeautifulSoup4 & Requests**: Web scraping para obtenção de Dividend Yield de fontes gratuitas (Funds Explorer e Status Invest).
--   **python-dotenv**: Gerenciamento seguro de variáveis de ambiente (API Keys).
+## 🗂 Estrutura do Projeto
 
-## ⚙️ Configuração e Instalação
+```
+dashboard-fiis/
+├── app.py                  # Entry point — configuração e roteamento de páginas
+├── config.py               # Constantes globais (paths, IR, listas de ativos)
+├── utils.py                # Formatação (brl, pct), simulação de projeção
+├── api/
+│   ├── prices.py           # Preços via Brapi REST; benchmark via yfinance
+│   └── scraping.py         # DY via FundsExplorer e StatusInvest
+├── data_layer/
+│   ├── assets.py           # Lista de ativos com cache CSV 30 min
+│   ├── portfolio.py        # I/O e métricas do portfólio
+│   └── proventos.py        # I/O do histórico de proventos
+├── pages/
+│   ├── explore.py          # Página: Explorar Ativos
+│   ├── portfolio.py        # Página: Minha Carteira
+│   └── projection.py       # Página: Projeções de IF
+├── tests/
+│   └── test_app.py         # 28 testes unitários (pytest)
+├── data/                   # Gerado em execução — NÃO commitar
+│   ├── ativos.csv          # Cache de ativos e preços (30 min)
+│   ├── portfolio.json      # Carteira do usuário
+│   ├── proventos.json      # Histórico de proventos
+│   └── dashboard.log       # Log de execução
+├── requirements.txt
+├── .env                    # Variáveis de ambiente (NÃO commitar)
+├── .env.example
+└── pytest.ini
+```
 
-Siga os passos abaixo para configurar e rodar o dashboard em sua máquina local.
+---
 
+## 🚀 Instalação e Execução
 
-### 1. Clone o Repositório
+### 1. Clone o repositório
 
-Primeiro, clone este repositório para o seu ambiente local:
-
-
+```bash
 git clone https://github.com/antonimattei/dashboard-fiis.git
 cd dashboard-fiis
+```
 
-
-### 2. Crie e Ative um Ambiente Virtual (Recomendado)
-É uma boa prática usar um ambiente virtual para isolar as dependências do projeto:
+### 2. Crie e ative um ambiente virtual
 
 ```bash
 python -m venv venv
-# No Windows
+
+# Windows
 .\venv\Scripts\activate
-# No macOS/Linux
+
+# macOS / Linux
 source venv/bin/activate
 ```
 
-### 3. Instale as Dependências
-Instale todas as bibliotecas Python necessárias listadas no requirements.txt:
+### 3. Instale as dependências
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Configure as Variáveis de Ambiente
-Para proteger sua chave da API da Brapi, usaremos variáveis de ambiente.
+### 4. Configure a chave da Brapi
 
-Crie o arquivo .env:
-Copie o arquivo de exemplo .env.example para um novo arquivo chamado .env na raiz do projeto:
+Crie o arquivo `.env` a partir do exemplo:
+
 ```bash
-copy .env.example .env # No Windows
-cp .env.example .env   # No macOS/Linux
+# Windows
+copy .env.example .env
+
+# macOS / Linux
+cp .env.example .env
 ```
-Obtenha sua chave da Brapi:
-Acesse o site da Brapi.
-Crie uma conta gratuita.
-Após o login, localize e copie sua API Key.
-Edite o arquivo .env:
-Abra o arquivo .env que você acabou de criar e cole sua chave da API:
-BRAPI_API_KEY=SUA_CHAVE_DA_API_AQUI
-Importante: O arquivo .env está listado no .gitignore e NÃO DEVE SER COMMITADO para o controle de versão. Isso garante que sua chave da API permaneça privada.
 
+Edite `.env` e insira sua chave (obtenha gratuitamente em [brapi.dev](https://brapi.dev)):
 
-### 5. Execute o Dashboard
-Com todas as dependências instaladas e a API Key configurada, você pode iniciar o dashboard:
+```
+BRAPI_API_KEY=SUA_CHAVE_AQUI
+```
+
+> **Importante:** o arquivo `.env` está no `.gitignore` e nunca deve ser commitado.
+
+### 5. Execute o dashboard
 
 ```bash
 streamlit run app.py
 ```
-O Streamlit abrirá automaticamente o dashboard em seu navegador padrão (geralmente em http://localhost:8501).
 
-```text
-dashboard-fiis/
-├── app.py               # Código principal da aplicação Streamlit
-├── requirements.txt     # Lista de dependências do Python
-├── .env                 # Variáveis de ambiente (NÃO commitar no Git!)
-├── .env.example         # Exemplo de arquivo .env para configuração
-├── .gitignore           # Arquivos e pastas ignorados pelo Git
-├── data/                # Pasta para armazenar dados locais
-│   ├── ifix_tickers.csv # Lista de FIIs com preços e DY (atualizado pelo app)
-│   └── portfolio.json   # Dados da sua carteira de FIIs
-└── README.md            # Este arquivo
+O dashboard abrirá automaticamente em [http://localhost:8501](http://localhost:8501).
+
+---
+
+## 🧪 Testes
+
+```bash
+pytest tests/
 ```
-🛡️ Segurança e Boas Práticas
-Nunca commite o arquivo .env: Sua chave da API é um dado sensível. O .gitignore já está configurado para ignorá-lo.
-Mantenha suas dependências atualizadas: Periodicamente, execute pip install -r requirements.txt --upgrade para garantir que você está usando as versões mais recentes das bibliotecas.
-Cache de dados: O dashboard utiliza cache para as chamadas de API e web scraping, reduzindo o número de requisições e acelerando o carregamento.
-📚 Fontes de Dados
-Preços de FIIs: Brapi
-Dividend Yield (DY): Funds Explorer e Status Invest (via web scraping)
-🤝 Contribuição
-Contribuições são bem-vindas! Se você tiver sugestões de melhorias, novas funcionalidades ou encontrar algum bug, sinta-se à vontade para abrir uma issue ou enviar um pull request.
 
-📝 Licença
-Este projeto está licenciado sob a licença MIT. Veja o arquivo LICENSE para mais detalhes.
+28 testes unitários cobrindo: classificação de tickers, operações de carteira (compra/venda/PM), projeções financeiras, e persistência de portfólio e proventos.
+
+---
+
+## 📡 Fontes de Dados
+
+| Dado | Fonte |
+|---|---|
+| Preços de ativos | [Brapi](https://brapi.dev) — REST API |
+| Lista de FIIs e ETFs | [Brapi](https://brapi.dev) — `quote/list?type=fund` |
+| Lista de Ações | [Brapi](https://brapi.dev) — `quote/list?type=stock` |
+| Dividend Yield (FIIs) | [FundsExplorer](https://fundsexplorer.com.br) + [StatusInvest](https://statusinvest.com.br) |
+| Dividend Yield (Ações/ETFs) | [StatusInvest](https://statusinvest.com.br) |
+| Benchmark IFIX / Ibovespa | [yfinance](https://github.com/ranaroussi/yfinance) |
+
+> Preços são cacheados localmente por 30 minutos. DY é cacheado por 24 horas.
+
+---
+
+## 🛡️ Segurança
+
+- Nunca commite o arquivo `.env` — a chave da API é dado sensível
+- A pasta `data/` contém dados pessoais de carteira — adicione ao `.gitignore` se usar repositório público
+
+---
+
+## 📝 Licença
+
+Distribuído sob a licença MIT. Veja o arquivo [LICENSE](LICENSE) para mais detalhes.
