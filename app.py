@@ -38,208 +38,47 @@ if not BRAPI_API_KEY:
 client = Brapi(api_key=BRAPI_API_KEY)
 
 DATA_DIR = "data"
-IFIX_CSV = os.path.join(DATA_DIR, "ifix_tickers.csv")
+ATIVOS_CSV = os.path.join(DATA_DIR, "ativos.csv")
 PORTFOLIO_JSON = os.path.join(DATA_DIR, "portfolio.json")
 PROVENTOS_JSON = os.path.join(DATA_DIR, "proventos.json")
 
-st.set_page_config(page_title="Dashboard FIIs IFIX", layout="wide")
+st.set_page_config(page_title="Dashboard Investimentos BR", layout="wide")
 
-# ============= FUNÇÕES DE API BRAPI =============
+# ============= HELPERS =============
 
-@st.cache_data(ttl=60*30)
-def get_last_price(ticker):
-    """Busca último preço via Brapi com retry (3 tentativas)"""
-    for attempt in range(3):
-        try:
-            quote = client.quote.retrieve(tickers=ticker)
-            if quote.results and len(quote.results) > 0:
-                result = quote.results[0]
-                if hasattr(result, 'regular_market_price') and result.regular_market_price:
-                    price = float(result.regular_market_price)
-                    logger.info("Preço obtido: %s = R$ %.2f", ticker, price)
-                    return price
-            logger.warning("Preço não encontrado na resposta Brapi para %s", ticker)
-            return None
-        except Exception as e:
-            wait = 2 ** attempt
-            logger.warning("Tentativa %d/3 falhou ao buscar preço de %s: %s. Aguardando %ds...", attempt + 1, ticker, e, wait)
-            if attempt < 2:
-                time.sleep(wait)
-    logger.error("Todas as tentativas falharam ao buscar preço de %s", ticker)
-    return None
+def brl(value):
+    """Formata valor em reais no padrão brasileiro."""
+    return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-# ============= FUNÇÕES DE DIVIDENDOS (API ALTERNATIVA GRATUITA FUNDSEXPLORER) =============
+def pct(value):
+    """Formata percentual no padrão brasileiro."""
+    return f"{value:,.2f}%".replace(",", "X").replace(".", ",").replace("X", ".")
 
-@st.cache_data(ttl=60*60*24)  # Cache de 24 horas
-def get_dy_from_fundsexplorer(ticker):
-    """Busca DY do Funds Explorer (fonte gratuita)"""
-    try:
-        url = f"https://www.fundsexplorer.com.br/funds/{ticker.lower()}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+# ============= TIPOS DE ATIVO =============
 
-        response = None
-        for attempt in range(3):
-            try:
-                response = requests.get(url, headers=headers, timeout=10)
-                break
-            except requests.RequestException as req_err:
-                wait = 2 ** attempt
-                logger.warning("FundsExplorer tentativa %d/3 para %s: %s. Aguardando %ds...", attempt + 1, ticker, req_err, wait)
-                if attempt < 2:
-                    time.sleep(wait)
-        if response is None:
-            logger.error("FundsExplorer: todas as tentativas falharam para %s", ticker)
-            return None
+# Configuração por tipo: alíquota IR sobre ganho de capital e fonte de DY
+ASSET_CONFIG = {
+    "FII":  {"ir_ganho": 0.20, "ir_dividendo": 0.00, "label": "FII"},
+    "Ação": {"ir_ganho": 0.15, "ir_dividendo": 0.00, "label": "Ação"},
+    "ETF":  {"ir_ganho": 0.15, "ir_dividendo": 0.00, "label": "ETF"},
+}
 
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            dy_elements = soup.find_all('span', class_='indicator-value')
+# ETFs de índice conhecidos (terminam em 11 mas não são FIIs)
+ETFS_BR = {
+    "BOVA11","SMAL11","IVVB11","GOLD11","HASH11","XFIX11","SPXI11",
+    "DIVO11","FIND11","MATB11","ACWI11","NASD11","FIXA11","GOVE11",
+    "BBSD11","IMAB11","IRFM11","LFTE11","MOVA11","TRIG11",
+}
 
-            for elem in dy_elements:
-                text = elem.get_text().strip()
-                if '%' in text:
-                    try:
-                        dy_str = text.replace('%', '').replace(',', '.').strip()
-                        dy_value = float(dy_str)
-                        if 0 < dy_value < 50:
-                            logger.info("DY FundsExplorer: %s = %.2f%%", ticker, dy_value)
-                            return dy_value / 100
-                    except:
-                        continue
+# Ações populares do Ibovespa (fallback offline)
+ACOES_FALLBACK = [
+    "ITUB4","PETR4","VALE3","BBDC4","ABEV3","B3SA3","WEGE3","RENT3",
+    "BBAS3","SUZB3","EGIE3","RDOR3","SBSP3","ENEV3","VIVT3","GGBR4",
+    "PRIO3","CPLE6","JBSS3","MRVE3","CYRE3","MULT3","LREN3","MGLU3",
+    "PETZ3","RECV3","RADL3","TOTS3","EMBR3","BEEF3",
+]
 
-            tables = soup.find_all('table')
-            for table in tables:
-                rows = table.find_all('tr')
-                for row in rows:
-                    cells = row.find_all(['td', 'th'])
-                    for i, cell in enumerate(cells):
-                        if 'dividend yield' in cell.get_text().lower() or 'dy' in cell.get_text().lower():
-                            if i + 1 < len(cells):
-                                try:
-                                    dy_text = cells[i + 1].get_text().strip()
-                                    dy_str = dy_text.replace('%', '').replace(',', '.').strip()
-                                    dy_value = float(dy_str)
-                                    if 0 < dy_value < 50:
-                                        logger.info("DY FundsExplorer (tabela): %s = %.2f%%", ticker, dy_value)
-                                        return dy_value / 100
-                                except:
-                                    continue
-        else:
-            logger.warning("FundsExplorer retornou HTTP %d para %s", response.status_code, ticker)
-    except Exception as e:
-        logger.warning("Erro ao buscar DY do FundsExplorer para %s: %s", ticker, e)
-    logger.debug("DY não encontrado no FundsExplorer para %s", ticker)
-    return None
-
-@st.cache_data(ttl=60*60*24)
-def get_dy_from_statusinvest(ticker):
-    """Busca DY do Status Invest (fonte gratuita alternativa)"""
-    try:
-        url = f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-
-        response = None
-        for attempt in range(3):
-            try:
-                response = requests.get(url, headers=headers, timeout=10)
-                break
-            except requests.RequestException as req_err:
-                wait = 2 ** attempt
-                logger.warning("StatusInvest tentativa %d/3 para %s: %s. Aguardando %ds...", attempt + 1, ticker, req_err, wait)
-                if attempt < 2:
-                    time.sleep(wait)
-        if response is None:
-            logger.error("StatusInvest: todas as tentativas falharam para %s", ticker)
-            return None
-
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-
-            dy_divs = soup.find_all('div', class_='value')
-            for div in dy_divs:
-                text = div.get_text().strip()
-                if '%' in text:
-                    try:
-                        dy_str = text.replace('%', '').replace(',', '.').strip()
-                        dy_value = float(dy_str)
-                        if 0 < dy_value < 50:
-                            logger.info("DY StatusInvest: %s = %.2f%%", ticker, dy_value)
-                            return dy_value / 100
-                    except:
-                        continue
-
-            strong_tags = soup.find_all('strong', class_='value')
-            for tag in strong_tags:
-                text = tag.get_text().strip()
-                if '%' in text:
-                    try:
-                        dy_str = text.replace('%', '').replace(',', '.').strip()
-                        dy_value = float(dy_str)
-                        if 0 < dy_value < 50:
-                            logger.info("DY StatusInvest (strong): %s = %.2f%%", ticker, dy_value)
-                            return dy_value / 100
-                    except:
-                        continue
-        else:
-            logger.warning("StatusInvest retornou HTTP %d para %s", response.status_code, ticker)
-    except Exception as e:
-        logger.warning("Erro ao buscar DY do StatusInvest para %s: %s", ticker, e)
-    logger.debug("DY não encontrado no StatusInvest para %s", ticker)
-    return None
-
-def get_dy_12m_estimate(ticker):
-    """
-    Busca DY de múltiplas fontes gratuitas
-    Ordem de prioridade: Funds Explorer -> Status Invest -> Estimativa padrão
-    """
-    dy = get_dy_from_fundsexplorer(ticker)
-    if dy is not None and dy > 0:
-        return dy
-    
-    dy = get_dy_from_statusinvest(ticker)
-    if dy is not None and dy > 0:
-        return dy
-    
-    # Se não conseguir de nenhuma fonte, retorna None
-    return None
-
-@st.cache_data(ttl=60*60*6)  # Cache de 6 horas
-def get_ifix_performance(period="1y"):
-    """Busca cotação histórica do IFIX via yfinance para comparativo"""
-    try:
-        ticker_ifix = yf.Ticker("IFIX11.SA")
-        hist = ticker_ifix.history(period=period)
-        if hist.empty:
-            logger.warning("IFIX11.SA sem dados no yfinance, tentando ^IFIX")
-            ticker_ifix = yf.Ticker("^IFIX")
-            hist = ticker_ifix.history(period=period)
-        if not hist.empty:
-            first = hist["Close"].iloc[0]
-            last = hist["Close"].iloc[-1]
-            pct = (last - first) / first * 100
-            logger.info("IFIX performance (%s): %.2f%%", period, pct)
-            return hist["Close"].reset_index(), pct
-    except Exception as e:
-        logger.warning("Erro ao buscar performance do IFIX: %s", e)
-    return None, None
-
-
-def get_dividends_12m(ticker):
-    """Calcula dividendos anuais baseado no DY e preço atual"""
-    price = get_last_price(ticker)
-    dy = get_dy_12m_estimate(ticker)
-    
-    if price and dy and price > 0 and dy > 0:
-        return price * dy
-    
-    return 0.0
-
-# ============= LISTA DE FIIs CONHECIDOS (FALLBACK) =============
-
+# FIIs conhecidos (fallback offline)
 FIIS_FALLBACK = [
     "ALZR11","BCFF11","BRCR11","BTLG11","CVBI11","DEVA11","GALG11",
     "GGRC11","HGBS11","HGCR11","HGFF11","HGLG11","HGPO11","HGRE11",
@@ -250,109 +89,259 @@ FIIS_FALLBACK = [
     "VIFI11","VILG11","VINO11","VISC11","VRTA11","XPCI11","XPLG11","XPML11",
 ]
 
-# ============= FUNÇÕES DE PORTFOLIO =============
+def classify_ticker(ticker):
+    """Classifica o tipo do ativo pelo ticker."""
+    t = ticker.upper()
+    if t in ETFS_BR:
+        return "ETF"
+    if t.endswith("11"):
+        return "FII"
+    return "Ação"
 
-@st.cache_data(ttl=60*30)  # Cache de 30 minutos
-def _fetch_ifix_from_brapi():
-    """
-    Busca lista de FIIs + preço atual via endpoint REST da Brapi (type=fund).
-    Retorna lista de dicts com ticker, nome, tipo, preco_atual.
-    """
-    try:
-        url = f"https://brapi.dev/api/quote/list?type=fund&token={BRAPI_API_KEY}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code == 200:
-            stocks = response.json().get("stocks", [])
-            # Filtra apenas FIIs reais: terminam em 11 e estão na lista de referência
-            # ou têm volume > 0 (exclui ETFs sem negociação típica de FII)
-            tickers_ref = set(FIIS_FALLBACK)
-            fiis = []
-            for s in stocks:
-                ticker = s.get("stock", "").upper()
-                if not ticker.endswith("11"):
-                    continue
-                # Inclui se está na lista de referência OU se não é ETF conhecido
-                etfs_conhecidos = {"BOVA11", "SMAL11", "IVVB11", "GOLD11", "HASH11",
-                                   "XFIX11", "SPXI11", "DIVO11", "FIND11", "MATB11"}
-                if ticker in etfs_conhecidos and ticker not in tickers_ref:
-                    continue
-                fiis.append({
-                    "ticker": ticker,
-                    "nome": s.get("name", ticker),
-                    "tipo": "FII",
-                    "preco_atual": float(s.get("close") or 0.0),
-                    "dy_12m": 0.0,
-                    "data_atualizacao": datetime.now().strftime("%Y-%m-%d %H:%M") if s.get("close") else "",
-                })
-            if fiis:
-                logger.info("Lista Brapi (REST): %d FIIs encontrados com preços", len(fiis))
-                return fiis
-    except Exception as e:
-        logger.warning("Erro ao buscar lista da Brapi (REST): %s", e)
+# ============= FUNÇÕES DE PREÇO (BRAPI) =============
+
+@st.cache_data(ttl=60 * 30)
+def get_last_price(ticker):
+    """Busca último preço via Brapi com retry (3 tentativas)."""
+    for attempt in range(3):
+        try:
+            quote = client.quote.retrieve(tickers=ticker)
+            if quote.results and len(quote.results) > 0:
+                result = quote.results[0]
+                if hasattr(result, "regular_market_price") and result.regular_market_price:
+                    price = float(result.regular_market_price)
+                    logger.info("Preço obtido: %s = R$ %.2f", ticker, price)
+                    return price
+            logger.warning("Preço não encontrado na resposta Brapi para %s", ticker)
+            return None
+        except Exception as e:
+            wait = 2 ** attempt
+            logger.warning("Tentativa %d/3 falhou para %s: %s. Aguardando %ds...", attempt + 1, ticker, e, wait)
+            if attempt < 2:
+                time.sleep(wait)
+    logger.error("Todas as tentativas falharam ao buscar preço de %s", ticker)
     return None
 
+# ============= FUNÇÕES DE DY / MÉTRICAS (SCRAPING) =============
 
-def load_ifix_list():
-    """
-    Carrega lista de FIIs com prioridade:
-    1. CSV em disco com menos de 30 min (cache local)
-    2. API Brapi REST (lista + preços em uma chamada)
-    3. Lista hardcoded (fallback offline)
-    """
-    # 1. CSV recente (menos de 30 minutos)
-    if os.path.exists(IFIX_CSV):
+def _scrape_with_retry(url, headers, label):
+    """Executa GET com retry (3 tentativas). Retorna response ou None."""
+    for attempt in range(3):
         try:
-            age_minutes = (time.time() - os.path.getmtime(IFIX_CSV)) / 60
-            if age_minutes < 30:
-                df = pd.read_csv(IFIX_CSV)
+            r = requests.get(url, headers=headers, timeout=10)
+            return r
+        except requests.RequestException as e:
+            wait = 2 ** attempt
+            logger.warning("%s tentativa %d/3: %s. Aguardando %ds...", label, attempt + 1, e, wait)
+            if attempt < 2:
+                time.sleep(wait)
+    logger.error("%s: todas as tentativas falharam", label)
+    return None
+
+def _parse_pct(text, low=0, high=100):
+    """Extrai float de uma string com '%'. Retorna None se fora do intervalo."""
+    try:
+        v = float(text.replace("%", "").replace(",", ".").strip())
+        if low < v < high:
+            return v
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+@st.cache_data(ttl=60 * 60 * 24)
+def get_dy_from_fundsexplorer(ticker):
+    """Busca DY do FundsExplorer (apenas FIIs)."""
+    url = f"https://www.fundsexplorer.com.br/funds/{ticker.lower()}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    r = _scrape_with_retry(url, headers, f"FundsExplorer/{ticker}")
+    if r is None or r.status_code != 200:
+        if r:
+            logger.warning("FundsExplorer HTTP %d para %s", r.status_code, ticker)
+        return None
+    soup = BeautifulSoup(r.content, "html.parser")
+    for elem in soup.find_all("span", class_="indicator-value"):
+        v = _parse_pct(elem.get_text().strip(), 0, 50)
+        if v:
+            logger.info("DY FundsExplorer: %s = %.2f%%", ticker, v)
+            return v / 100
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = row.find_all(["td", "th"])
+            for i, cell in enumerate(cells):
+                if "dividend yield" in cell.get_text().lower() or " dy" in cell.get_text().lower():
+                    if i + 1 < len(cells):
+                        v = _parse_pct(cells[i + 1].get_text().strip(), 0, 50)
+                        if v:
+                            logger.info("DY FundsExplorer (tabela): %s = %.2f%%", ticker, v)
+                            return v / 100
+    logger.debug("DY não encontrado no FundsExplorer para %s", ticker)
+    return None
+
+@st.cache_data(ttl=60 * 60 * 24)
+def get_dy_from_statusinvest(ticker, asset_type="FII"):
+    """
+    Busca DY/DY no StatusInvest.
+    URL varia por tipo: FIIs → /fundos-imobiliarios/, Ações → /acoes/, ETFs → /etfs/
+    """
+    path_map = {"FII": "fundos-imobiliarios", "Ação": "acoes", "ETF": "etfs"}
+    path = path_map.get(asset_type, "acoes")
+    url = f"https://statusinvest.com.br/{path}/{ticker.lower()}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    r = _scrape_with_retry(url, headers, f"StatusInvest/{ticker}")
+    if r is None or r.status_code != 200:
+        if r:
+            logger.warning("StatusInvest HTTP %d para %s", r.status_code, ticker)
+        return None
+    soup = BeautifulSoup(r.content, "html.parser")
+    for tag in soup.find_all(["div", "strong"], class_="value"):
+        v = _parse_pct(tag.get_text().strip(), 0, 100)
+        if v:
+            logger.info("DY StatusInvest: %s = %.2f%%", ticker, v)
+            return v / 100
+    logger.debug("DY não encontrado no StatusInvest para %s", ticker)
+    return None
+
+def get_dy_12m_estimate(ticker, asset_type="FII"):
+    """Busca DY de múltiplas fontes. FIIs: FundsExplorer → StatusInvest. Ações/ETFs: StatusInvest."""
+    if asset_type == "FII":
+        dy = get_dy_from_fundsexplorer(ticker)
+        if dy is not None and dy > 0:
+            return dy
+    dy = get_dy_from_statusinvest(ticker, asset_type)
+    if dy is not None and dy > 0:
+        return dy
+    return None
+
+@st.cache_data(ttl=60 * 60 * 6)
+def get_benchmark_performance(symbol="IFIX11.SA", period="1y"):
+    """Busca histórico de um índice via yfinance (IFIX, IBOV, etc)."""
+    fallbacks = {
+        "IFIX11.SA": ["IFIX11.SA", "^IFIX"],
+        "^BVSP": ["^BVSP"],
+    }
+    tickers_to_try = fallbacks.get(symbol, [symbol])
+    for t in tickers_to_try:
+        try:
+            hist = yf.Ticker(t).history(period=period)
+            if not hist.empty:
+                first, last = hist["Close"].iloc[0], hist["Close"].iloc[-1]
+                pct_val = (last - first) / first * 100
+                logger.info("%s performance (%s): %.2f%%", t, period, pct_val)
+                return hist["Close"].reset_index(), pct_val
+        except Exception as e:
+            logger.warning("Erro ao buscar %s: %s", t, e)
+    return None, None
+
+# ============= LISTA DE ATIVOS =============
+
+@st.cache_data(ttl=60 * 30)
+def _fetch_ativos_from_brapi(asset_type="fund"):
+    """Busca lista de ativos + preço atual via REST Brapi. asset_type: 'fund' ou 'stock'."""
+    try:
+        url = f"https://brapi.dev/api/quote/list?type={asset_type}&token={BRAPI_API_KEY}"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if r.status_code == 200:
+            stocks = r.json().get("stocks", [])
+            logger.info("Brapi %s: %d ativos retornados", asset_type, len(stocks))
+            return stocks
+    except Exception as e:
+        logger.warning("Erro ao buscar lista Brapi type=%s: %s", asset_type, e)
+    return []
+
+def _build_ativos_list():
+    """Monta lista unificada de FIIs, ETFs e Ações com preços."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    ativos = []
+
+    # --- Fundos (FIIs + ETFs) ---
+    funds = _fetch_ativos_from_brapi("fund")
+    for s in funds:
+        ticker = s.get("stock", "").upper()
+        if not ticker.endswith("11"):
+            continue
+        tipo = "ETF" if ticker in ETFS_BR else "FII"
+        ativos.append({
+            "ticker": ticker,
+            "nome": s.get("name", ticker),
+            "tipo": tipo,
+            "preco_atual": float(s.get("close") or 0.0),
+            "dy_12m": 0.0,
+            "data_atualizacao": now_str if s.get("close") else "",
+        })
+
+    # --- Ações ---
+    stocks = _fetch_ativos_from_brapi("stock")
+    for s in stocks:
+        ticker = s.get("stock", "").upper()
+        # Exclui fundos que aparecem na lista de stocks e BDRs (terminam em 34/32/33)
+        if ticker.endswith("11") or ticker.endswith("34") or ticker.endswith("32"):
+            continue
+        ativos.append({
+            "ticker": ticker,
+            "nome": s.get("name", ticker),
+            "tipo": "Ação",
+            "preco_atual": float(s.get("close") or 0.0),
+            "dy_12m": 0.0,
+            "data_atualizacao": now_str if s.get("close") else "",
+        })
+
+    # Fallback offline se Brapi falhou
+    if not ativos:
+        logger.warning("Brapi indisponível — usando fallback offline")
+        for t in FIIS_FALLBACK:
+            ativos.append({"ticker": t, "nome": t, "tipo": "FII", "preco_atual": 0.0, "dy_12m": 0.0, "data_atualizacao": ""})
+        for t in ACOES_FALLBACK:
+            ativos.append({"ticker": t, "nome": t, "tipo": "Ação", "preco_atual": 0.0, "dy_12m": 0.0, "data_atualizacao": ""})
+        for t in ETFS_BR:
+            ativos.append({"ticker": t, "nome": t, "tipo": "ETF", "preco_atual": 0.0, "dy_12m": 0.0, "data_atualizacao": ""})
+
+    logger.info("Lista total: %d ativos", len(ativos))
+    return ativos
+
+def load_ativos_list():
+    """
+    Carrega lista de ativos com prioridade:
+    1. CSV em disco com menos de 30 min
+    2. API Brapi REST (lista + preços)
+    3. Fallback offline
+    """
+    if os.path.exists(ATIVOS_CSV):
+        try:
+            age_min = (time.time() - os.path.getmtime(ATIVOS_CSV)) / 60
+            if age_min < 30:
+                df = pd.read_csv(ATIVOS_CSV)
                 df["ticker"] = df["ticker"].str.upper().str.strip()
-                for col, default in [("preco_atual", 0.0), ("dy_12m", 0.0), ("data_atualizacao", "")]:
+                for col, default in [("preco_atual", 0.0), ("dy_12m", 0.0), ("data_atualizacao", ""), ("tipo", "FII")]:
                     if col not in df.columns:
                         df[col] = default
-                logger.info("CSV carregado do cache local (%.0f min atrás)", age_minutes)
+                logger.info("CSV cache carregado (%.0f min atrás, %d ativos)", age_min, len(df))
                 return df
         except Exception as e:
             logger.warning("CSV corrompido, recriando: %s", e)
 
-    # 2. Brapi REST (lista + preços)
-    fiis = _fetch_ifix_from_brapi()
-
-    # 3. Fallback hardcoded
-    if not fiis:
-        logger.warning("Usando lista hardcoded de FIIs (fallback offline)")
-        fiis = [{"ticker": t, "nome": t, "tipo": "FII",
-                 "preco_atual": 0.0, "dy_12m": 0.0, "data_atualizacao": ""} for t in FIIS_FALLBACK]
-
-    df = pd.DataFrame(fiis).sort_values("ticker").reset_index(drop=True)
-    save_ifix_list(df)
+    ativos = _build_ativos_list()
+    df = pd.DataFrame(ativos).sort_values(["tipo", "ticker"]).reset_index(drop=True)
+    save_ativos_list(df)
     return df
 
-
-def save_ifix_list(df):
-    """Salva lista de FIIs no CSV com preços e DY atualizados"""
+def save_ativos_list(df):
     os.makedirs(DATA_DIR, exist_ok=True)
-    df.to_csv(IFIX_CSV, index=False, encoding='utf-8')
+    df.to_csv(ATIVOS_CSV, index=False, encoding="utf-8")
 
-# ============= FUNÇÕES DE PROVENTOS =============
+# ============= PROVENTOS =============
 
 def load_proventos():
-    """Carrega histórico de proventos registrados manualmente"""
     if not os.path.exists(PROVENTOS_JSON):
         return []
     try:
         with open(PROVENTOS_JSON, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if not content:
-                return []
-            data = json.loads(content)
+            data = json.loads(f.read().strip() or "[]")
             return data if isinstance(data, list) else []
     except Exception as e:
         logger.error("Erro ao carregar proventos: %s", e)
         return []
 
 def save_proventos(proventos):
-    """Salva histórico de proventos"""
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(PROVENTOS_JSON, "w", encoding="utf-8") as f:
@@ -362,7 +351,6 @@ def save_proventos(proventos):
         st.error(f"❌ Erro ao salvar proventos: {e}")
 
 def add_provento(ticker, data_pagamento, valor_por_cota, quantidade):
-    """Adiciona um registro de provento recebido"""
     proventos = load_proventos()
     proventos.append({
         "ticker": ticker.upper(),
@@ -374,57 +362,44 @@ def add_provento(ticker, data_pagamento, valor_por_cota, quantidade):
     proventos.sort(key=lambda x: x["data"], reverse=True)
     save_proventos(proventos)
 
+# ============= PORTFOLIO =============
+
 def load_portfolio():
-    """Carrega portfolio com tratamento de erros"""
     if not os.path.exists(PORTFOLIO_JSON):
         return {"positions": []}
-    
     try:
         with open(PORTFOLIO_JSON, "r", encoding="utf-8") as f:
             content = f.read().strip()
-
             if not content:
                 return {"positions": []}
-
             data = json.loads(content)
-
             if not isinstance(data, dict):
                 return {"positions": []}
-            
-            if "positions" not in data:
-                data["positions"] = []
-            
+            data.setdefault("positions", [])
             return data
-            
     except json.JSONDecodeError as e:
         logger.error("portfolio.json corrompido: %s", e)
-        st.error(f"⚠️ Erro ao ler portfolio.json: {str(e)}")
+        st.error(f"⚠️ Erro ao ler portfolio.json: {e}")
         st.info("🔄 Criando novo portfolio...")
-        new_portfolio = {"positions": []}
-        save_portfolio(new_portfolio)
-        return new_portfolio
+        new = {"positions": []}
+        save_portfolio(new)
+        return new
     except Exception as e:
         logger.error("Erro inesperado ao carregar portfolio: %s", e)
-        st.error(f"❌ Erro inesperado: {str(e)}")
+        st.error(f"❌ Erro inesperado: {e}")
         return {"positions": []}
 
 def save_portfolio(data):
-    """Salva portfolio com validação"""
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-
         if not isinstance(data, dict):
             data = {"positions": []}
-        
-        if "positions" not in data:
-            data["positions"] = []
-        
+        data.setdefault("positions", [])
         with open(PORTFOLIO_JSON, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-            
     except Exception as e:
         logger.error("Erro ao salvar portfolio: %s", e)
-        st.error(f"❌ Erro ao salvar portfolio: {str(e)}")
+        st.error(f"❌ Erro ao salvar portfolio: {e}")
 
 def upsert_position(portfolio, ticker, quantity, buy_price):
     ticker = ticker.upper()
@@ -437,12 +412,10 @@ def upsert_position(portfolio, ticker, quantity, buy_price):
                 pos["quantity"] = 0
                 pos["avg_price"] = 0
             elif quantity > 0:
-                # Compra: recalcula preço médio ponderado
                 pos["avg_price"] = (old_qty * old_pm + quantity * buy_price) / new_qty
                 pos["quantity"] = new_qty
             else:
-                # Venda parcial: PM não se altera
-                pos["quantity"] = new_qty
+                pos["quantity"] = new_qty  # venda: PM não muda
             return
     portfolio["positions"].append({"ticker": ticker, "quantity": quantity, "avg_price": buy_price})
 
@@ -450,165 +423,135 @@ def clean_positions(portfolio):
     portfolio["positions"] = [p for p in portfolio["positions"] if p["quantity"] > 0]
 
 def calc_portfolio_metrics(portfolio):
-    """Calcula métricas do portfolio usando dados salvos no CSV quando disponível"""
-    df_ifix = load_ifix_list()
+    """Calcula métricas do portfolio. Busca do CSV primeiro, depois API."""
+    df_ativos = load_ativos_list()
     rows = []
-    
     for p in portfolio["positions"]:
         ticker = p["ticker"]
         qty = p["quantity"]
         pm = p["avg_price"]
-        
-        # Tentar buscar do CSV primeiro
-        ticker_data = df_ifix[df_ifix["ticker"] == ticker]
-        
-        if not ticker_data.empty and ticker_data.iloc[0]["preco_atual"] > 0:
-            price = ticker_data.iloc[0]["preco_atual"]
-            dy = ticker_data.iloc[0]["dy_12m"]
+        asset_type = classify_ticker(ticker)
+
+        cached = df_ativos[df_ativos["ticker"] == ticker]
+        if not cached.empty and cached.iloc[0]["preco_atual"] > 0:
+            price = float(cached.iloc[0]["preco_atual"])
+            dy = float(cached.iloc[0]["dy_12m"])  # já em %
         else:
-            # Se não tiver no CSV, buscar da API
-            price = get_last_price(ticker)
-            dy_raw = get_dy_12m_estimate(ticker)
+            price = get_last_price(ticker) or 0.0
+            dy_raw = get_dy_12m_estimate(ticker, asset_type)
             dy = (dy_raw * 100) if dy_raw is not None else 0.0
-            
-        if price is None:
-            price = 0.0
-        if dy is None:
-            dy = 0.0
-            
+
         market = qty * price
-        change = (price - pm) / pm if pm else 0.0
+        change = (price - pm) / pm * 100 if pm > 0 else 0.0
         monthly_income = (dy / 100 * price / 12.0) * qty
-        
+
         rows.append({
             "Ticker": ticker,
+            "Tipo": asset_type,
             "Qtde": qty,
-            "PM": pm,
-            "Preço Atual": price,
-            "Variação (%)": change * 100,
-            "DY 12m (%)": dy,
-            "Valor de Mercado": market,
-            "Renda Mensal Estimada": monthly_income
+            "PM (R$)": pm,
+            "Preço Atual (R$)": price,
+            "Variação (%)": change,
+            "DY/Yield 12m (%)": dy,
+            "Valor de Mercado (R$)": market,
+            "Renda Mensal Est. (R$)": monthly_income,
         })
-    
+
     df = pd.DataFrame(rows)
-    totals = {}
     if not df.empty:
-        totals["Patrimônio (R$)"] = df["Valor de Mercado"].sum()
-        totals["Renda Mensal (R$)"] = df["Renda Mensal Estimada"].sum()
-        if totals["Patrimônio (R$)"] > 0:
-            totals["DY Médio (%)"] = (totals["Renda Mensal (R$)"] * 12) / totals["Patrimônio (R$)"] * 100
-        else:
-            totals["DY Médio (%)"] = 0.0
+        pat = df["Valor de Mercado (R$)"].sum()
+        renda = df["Renda Mensal Est. (R$)"].sum()
+        dy_medio = (renda * 12) / pat * 100 if pat > 0 else 0.0
+        totals = {"Patrimônio (R$)": pat, "Renda Mensal (R$)": renda, "DY Médio (%)": dy_medio}
     else:
         totals = {"Patrimônio (R$)": 0.0, "Renda Mensal (R$)": 0.0, "DY Médio (%)": 0.0}
     return df, totals
 
 def simulate_projection(
-    start_capital,
-    current_monthly_income,
-    monthly_contribution,
-    target_monthly_income,
-    yearly_return=0.06,
-    yearly_dividend_growth=0.02,
-    yearly_contrib_growth=0.00,
-    max_years=40
+    start_capital, current_monthly_income, monthly_contribution,
+    target_monthly_income, yearly_return=0.06, yearly_dividend_growth=0.02,
+    yearly_contrib_growth=0.00, max_years=40
 ):
-    r_m = (1 + yearly_return) ** (1/12) - 1
-    g_div_m = (1 + yearly_dividend_growth) ** (1/12) - 1
-    g_contrib_m = (1 + yearly_contrib_growth) ** (1/12) - 1
-
-    if start_capital > 0:
-        monthly_yield = current_monthly_income / start_capital
-    else:
-        monthly_yield = 0.007
-
-    date_points = []
-    wealth_points = []
-    income_points = []
+    r_m = (1 + yearly_return) ** (1 / 12) - 1
+    g_div_m = (1 + yearly_dividend_growth) ** (1 / 12) - 1
+    g_contrib_m = (1 + yearly_contrib_growth) ** (1 / 12) - 1
+    monthly_yield = current_monthly_income / start_capital if start_capital > 0 else 0.007
 
     today = datetime.today()
-    month = 0
+    date_points, wealth_points, income_points = [], [], []
     wealth = start_capital
     income = current_monthly_income
-
     found_months = None
 
-    while month < max_years * 12:
+    for month in range(max_years * 12):
         date_points.append(today + relativedelta(months=month))
         wealth_points.append(wealth)
         income_points.append(income)
-
         if income >= target_monthly_income and found_months is None:
             found_months = month
-
-        monthly_yield = monthly_yield * (1 + g_div_m)
-        monthly_contribution = monthly_contribution * (1 + g_contrib_m)
+        monthly_yield *= (1 + g_div_m)
+        monthly_contribution *= (1 + g_contrib_m)
         income = wealth * monthly_yield
         wealth = wealth * (1 + r_m) + monthly_contribution
 
-        month += 1
-
-    df = pd.DataFrame({
-        "Data": date_points,
-        "Patrimônio (R$)": wealth_points,
-        "Renda Mensal (R$)": income_points
-    })
+    df = pd.DataFrame({"Data": date_points, "Patrimônio (R$)": wealth_points, "Renda Mensal (R$)": income_points})
     return df, found_months
 
-# ============= PÁGINAS =============
+# ============= STYLING =============
+
+def _highlight_dy(row, dy_min, dy_max):
+    dy = row.get("DY/Yield 12m (%)", 0)
+    if dy > 0 and dy < dy_min:
+        return ["background-color: #ffe5e5"] * len(row)
+    if dy >= dy_max:
+        return ["background-color: #fff3cd"] * len(row)
+    return [""] * len(row)
+
+# ============= PÁGINA: EXPLORAR =============
 
 def page_explore():
-    st.header("🔍 Explorar FIIs do IFIX")
-    df_ifix = load_ifix_list()
+    st.header("🔍 Explorar Ativos Brasileiros")
+    df_ativos = load_ativos_list()
 
-    search = st.text_input("Buscar por ticker ou nome", "").strip().upper()
-    df_view = df_ifix.copy()
+    col_f1, col_f2 = st.columns([3, 1])
+    with col_f1:
+        search = st.text_input("Buscar por ticker ou nome", "").strip().upper()
+    with col_f2:
+        tipo_filtro = st.selectbox("Tipo", ["Todos", "FII", "Ação", "ETF"])
+
+    df_view = df_ativos.copy()
     if search:
-        df_view = df_view[df_view.apply(lambda r: search in r["ticker"].upper() or search in str(r.get("nome", "")).upper(), axis=1)]
+        df_view = df_view[
+            df_view["ticker"].str.contains(search, na=False) |
+            df_view["nome"].str.upper().str.contains(search, na=False)
+        ]
+    if tipo_filtro != "Todos":
+        df_view = df_view[df_view["tipo"] == tipo_filtro]
 
-    # Preparar visualização
-    display_cols = ["ticker", "nome", "tipo"]
-    if "preco_atual" in df_view.columns:
-        display_cols.append("preco_atual")
-    if "dy_12m" in df_view.columns:
-        display_cols.append("dy_12m")
-    if "data_atualizacao" in df_view.columns:
-        display_cols.append("data_atualizacao")
-    
+    display_cols = ["ticker", "nome", "tipo", "preco_atual", "dy_12m", "data_atualizacao"]
     df_display = df_view[display_cols].copy()
-    df_display.columns = ["Ticker", "Nome", "Tipo", "Preço Atual (R$)", "DY 12m (%)", "Última Atualização"]
-    
-    st.caption("💡 Clique em 'Atualizar métricas' para buscar preço e DY dos tickers visíveis e salvar no CSV.")
-    st.info("📊 **DY obtido de:** Funds Explorer e Status Invest (fontes gratuitas)")
-    
-    if st.button("🔄 Atualizar métricas"):
-        with st.spinner("Buscando dados do mercado (Brapi + Funds Explorer + Status Invest)..."):
-            progress_bar = st.progress(0)
+    df_display.columns = ["Ticker", "Nome", "Tipo", "Preço Atual (R$)", "DY/Yield 12m (%)", "Última Atualização"]
+
+    st.caption(f"📋 {len(df_view)} ativos encontrados | 💡 'Atualizar DY' busca Dividend Yield via web scraping")
+    st.info("📊 **DY/Yield:** FIIs → FundsExplorer + StatusInvest | Ações/ETFs → StatusInvest")
+
+    if st.button("🔄 Atualizar DY dos ativos visíveis"):
+        with st.spinner("Buscando DY (pode demorar para muitos ativos)..."):
             total = len(df_view)
-            data_atualizacao = datetime.now().strftime("%Y-%m-%d %H:%M")
-            
-            for idx, row in df_view.iterrows():
+            progress_bar = st.progress(0.0)
+            data_att = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+            for i, (_, row) in enumerate(df_view.iterrows()):
                 ticker = row["ticker"]
-                
-                # Buscar preço
-                price = get_last_price(ticker)
-                df_ifix.loc[df_ifix["ticker"] == ticker, "preco_atual"] = price if price else 0.0
-                
-                # Buscar DY
-                dy = get_dy_12m_estimate(ticker)
-                df_ifix.loc[df_ifix["ticker"] == ticker, "dy_12m"] = (dy * 100) if dy is not None else 0.0
-                
-                # Atualizar data
-                df_ifix.loc[df_ifix["ticker"] == ticker, "data_atualizacao"] = data_atualizacao
-                
-                progress_bar.progress((idx + 1) / total)
-            
-            # Salvar CSV atualizado
-            save_ifix_list(df_ifix)
-            
+                asset_type = row.get("tipo", classify_ticker(ticker))
+                dy = get_dy_12m_estimate(ticker, asset_type)
+                df_ativos.loc[df_ativos["ticker"] == ticker, "dy_12m"] = (dy * 100) if dy is not None else 0.0
+                df_ativos.loc[df_ativos["ticker"] == ticker, "data_atualizacao"] = data_att
+                progress_bar.progress((i + 1) / total)
+
+            save_ativos_list(df_ativos)
             progress_bar.empty()
-            st.success(f"✅ Métricas atualizadas e salvas no CSV em {data_atualizacao}!")
+            st.success(f"✅ DY atualizado para {total} ativos em {data_att}!")
             st.rerun()
 
     st.dataframe(df_display, use_container_width=True)
@@ -616,33 +559,26 @@ def page_explore():
     st.subheader("➕ Adicionar posição à carteira")
     col1, col2, col3 = st.columns(3)
     with col1:
-        ticker = st.text_input("Ticker (ex.: HGLG11)", "")
+        ticker_input = st.text_input("Ticker (ex.: HGLG11, ITUB4, BOVA11)", "")
     with col2:
         qty = st.number_input("Quantidade", min_value=1, value=10, step=1)
     with col3:
         buy_price = st.number_input("Preço de compra (R$)", min_value=0.0, value=100.0, step=0.1, format="%.2f")
 
-    if st.button("✅ Adicionar"):
-        if ticker:
+    if st.button("✅ Adicionar à carteira"):
+        if ticker_input:
             portfolio = load_portfolio()
-            upsert_position(portfolio, ticker.upper(), qty, buy_price)
+            upsert_position(portfolio, ticker_input.upper(), qty, buy_price)
             clean_positions(portfolio)
             save_portfolio(portfolio)
-            st.success(f"✅ {qty} cotas de {ticker.upper()} adicionadas à carteira!")
+            tipo_det = classify_ticker(ticker_input)
+            st.success(f"✅ {qty}x {ticker_input.upper()} ({tipo_det}) adicionado à carteira!")
             st.balloons()
             st.rerun()
         else:
             st.error("❌ Informe um ticker válido.")
 
-def _highlight_dy(row, dy_min, dy_max):
-    """Aplica cor de fundo na linha conforme o DY."""
-    dy = row.get("DY 12m (%)", 0)
-    if dy > 0 and dy < dy_min:
-        return ["background-color: #ffe5e5"] * len(row)
-    if dy >= dy_max:
-        return ["background-color: #fff3cd"] * len(row)
-    return [""] * len(row)
-
+# ============= PÁGINA: CARTEIRA =============
 
 def page_portfolio(dy_min=6.0, dy_max=15.0):
     st.header("💼 Minha Carteira")
@@ -652,32 +588,33 @@ def page_portfolio(dy_min=6.0, dy_max=15.0):
         df, totals = calc_portfolio_metrics(portfolio)
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("💰 Patrimônio", f"R$ {totals['Patrimônio (R$)']:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    col2.metric("📈 Renda Mensal Est.", f"R$ {totals['Renda Mensal (R$)']:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    col3.metric("📊 DY Médio", f"{totals['DY Médio (%)']:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
+    col1.metric("💰 Patrimônio Total", brl(totals["Patrimônio (R$)"]))
+    col2.metric("📈 Renda Mensal Est.", brl(totals["Renda Mensal (R$)"]))
+    col3.metric("📊 DY/Yield Médio", pct(totals["DY Médio (%)"]))
 
-    if not df.empty:
+    if df.empty:
+        st.info("📭 Sua carteira está vazia. Adicione ativos na aba 'Explorar'.")
+    else:
         # Alertas de DY
-        alertas_baixo = df[df["DY 12m (%)"].between(0.01, dy_min, inclusive="left")]
-        alertas_alto = df[df["DY 12m (%)"] >= dy_max]
+        alertas_baixo = df[(df["DY/Yield 12m (%)"] > 0) & (df["DY/Yield 12m (%)"] < dy_min)]
+        alertas_alto = df[df["DY/Yield 12m (%)"] >= dy_max]
         if not alertas_baixo.empty:
-            tickers_baixo = ", ".join(alertas_baixo["Ticker"].tolist())
-            st.warning(f"⚠️ DY abaixo de {dy_min:.1f}%: **{tickers_baixo}**")
+            st.warning(f"⚠️ DY/Yield abaixo de {dy_min:.1f}%: **{', '.join(alertas_baixo['Ticker'].tolist())}**")
         if not alertas_alto.empty:
-            tickers_alto = ", ".join(alertas_alto["Ticker"].tolist())
-            st.info(f"🟡 DY acima de {dy_max:.1f}% (atenção ao risco): **{tickers_alto}**")
+            st.info(f"🟡 DY/Yield acima de {dy_max:.1f}% (verifique risco): **{', '.join(alertas_alto['Ticker'].tolist())}**")
 
         styled = df.style.format({
-            "PM": "R$ {:.2f}",
-            "Preço Atual": "R$ {:.2f}",
-            "Variação (%)": "{:.2f}%",
-            "DY 12m (%)": "{:.2f}%",
-            "Valor de Mercado": "R$ {:.2f}",
-            "Renda Mensal Estimada": "R$ {:.2f}"
+            "PM (R$)": "R$ {:.2f}",
+            "Preço Atual (R$)": "R$ {:.2f}",
+            "Variação (%)": "{:+.2f}%",
+            "DY/Yield 12m (%)": "{:.2f}%",
+            "Valor de Mercado (R$)": "R$ {:.2f}",
+            "Renda Mensal Est. (R$)": "R$ {:.2f}",
         }).apply(_highlight_dy, dy_min=dy_min, dy_max=dy_max, axis=1)
         st.dataframe(styled, use_container_width=True)
-        st.caption(f"🔴 DY < {dy_min:.1f}%  |  🟡 DY ≥ {dy_max:.1f}%  (thresholds configuráveis na barra lateral)")
+        st.caption(f"🔴 DY < {dy_min:.1f}%  |  🟡 DY ≥ {dy_max:.1f}%  (ajuste na barra lateral)")
 
+        # ---- Alocação ----
         st.markdown("---")
         st.subheader("📊 Alocação da Carteira")
         col_pie, col_bar = st.columns(2)
@@ -685,150 +622,155 @@ def page_portfolio(dy_min=6.0, dy_max=15.0):
         with col_pie:
             fig_pie = go.Figure(go.Pie(
                 labels=df["Ticker"],
-                values=df["Valor de Mercado"],
+                values=df["Valor de Mercado (R$)"],
                 hole=0.4,
                 textinfo="label+percent",
                 hovertemplate="<b>%{label}</b><br>R$ %{value:,.2f}<br>%{percent}<extra></extra>",
             ))
-            fig_pie.update_layout(
-                title="Participação por FII (%)",
-                showlegend=False,
-                height=380,
-                margin=dict(t=40, b=0, l=0, r=0),
-            )
+            fig_pie.update_layout(title="Participação por ativo (%)", showlegend=False, height=380,
+                                  margin=dict(t=40, b=0, l=0, r=0))
             st.plotly_chart(fig_pie, use_container_width=True)
 
         with col_bar:
-            df_sorted = df.sort_values("Valor de Mercado", ascending=True)
+            df_sorted = df.sort_values("Valor de Mercado (R$)", ascending=True)
             fig_bar = go.Figure(go.Bar(
-                x=df_sorted["Valor de Mercado"],
+                x=df_sorted["Valor de Mercado (R$)"],
                 y=df_sorted["Ticker"],
                 orientation="h",
-                text=df_sorted["Valor de Mercado"].apply(lambda v: f"R$ {v:,.0f}"),
+                text=df_sorted["Valor de Mercado (R$)"].apply(lambda v: f"R$ {v:,.0f}"),
                 textposition="outside",
                 marker_color="royalblue",
                 hovertemplate="<b>%{y}</b><br>R$ %{x:,.2f}<extra></extra>",
             ))
-            fig_bar.update_layout(
-                title="Valor de Mercado por FII (R$)",
-                xaxis=dict(title="R$"),
-                yaxis=dict(title=""),
-                height=380,
-                margin=dict(t=40, b=0, l=0, r=10),
-            )
+            fig_bar.update_layout(title="Valor de Mercado por ativo (R$)", height=380,
+                                  xaxis=dict(title="R$"), yaxis=dict(title=""),
+                                  margin=dict(t=40, b=0, l=0, r=10))
             st.plotly_chart(fig_bar, use_container_width=True)
-        # ---- Comparativo com IFIX ----
+
+        # Alocação por tipo
+        if df["Tipo"].nunique() > 1:
+            df_tipo = df.groupby("Tipo")["Valor de Mercado (R$)"].sum().reset_index()
+            fig_tipo = go.Figure(go.Pie(
+                labels=df_tipo["Tipo"],
+                values=df_tipo["Valor de Mercado (R$)"],
+                hole=0.4,
+                textinfo="label+percent",
+                hovertemplate="<b>%{label}</b><br>R$ %{value:,.2f}<br>%{percent}<extra></extra>",
+            ))
+            fig_tipo.update_layout(title="Alocação por tipo de ativo", height=300,
+                                   margin=dict(t=40, b=0, l=0, r=0))
+            st.plotly_chart(fig_tipo, use_container_width=True)
+
+        # ---- Comparativo vs benchmark ----
         st.markdown("---")
-        st.subheader("📈 Comparativo vs IFIX")
+        st.subheader("📈 Comparativo vs Benchmark")
 
-        period_map = {"1 mês": "1mo", "3 meses": "3mo", "6 meses": "6mo", "1 ano": "1y", "2 anos": "2y"}
-        period_label = st.selectbox("Período", list(period_map.keys()), index=3, key="ifix_period")
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            benchmark_opt = st.selectbox("Benchmark", ["IFIX (FIIs)", "Ibovespa"], key="bench_sel")
+        with col_b2:
+            period_map = {"1 mês": "1mo", "3 meses": "3mo", "6 meses": "6mo", "1 ano": "1y", "2 anos": "2y"}
+            period_label = st.selectbox("Período", list(period_map.keys()), index=3, key="bench_period")
         period_code = period_map[period_label]
+        bench_symbol = "IFIX11.SA" if "IFIX" in benchmark_opt else "^BVSP"
 
-        with st.spinner("Buscando dados do IFIX..."):
-            hist_ifix, ifix_pct = get_ifix_performance(period_code)
+        with st.spinner(f"Buscando {benchmark_opt}..."):
+            hist_bench, bench_pct = get_benchmark_performance(bench_symbol, period_code)
 
-        # Rentabilidade da carteira no período: usa variação média ponderada (Preço Atual vs PM)
-        total_mercado = df["Valor de Mercado"].sum()
+        total_mercado = df["Valor de Mercado (R$)"].sum()
         if total_mercado > 0:
-            df["_peso"] = df["Valor de Mercado"] / total_mercado
-            carteira_pct = (df["Variação (%)"] * df["_peso"]).sum()
+            pesos = df["Valor de Mercado (R$)"] / total_mercado
+            carteira_pct = (df["Variação (%)"] * pesos).sum()
         else:
             carteira_pct = 0.0
 
         col_c1, col_c2, col_c3 = st.columns(3)
         col_c1.metric("📊 Sua carteira (vs PM)", f"{carteira_pct:+.2f}%")
-        if ifix_pct is not None:
-            diff = carteira_pct - ifix_pct
-            col_c2.metric(f"📉 IFIX ({period_label})", f"{ifix_pct:+.2f}%")
-            col_c3.metric("⚖️ Alpha (carteira − IFIX)", f"{diff:+.2f}%", delta_color="normal")
+        if bench_pct is not None:
+            diff = carteira_pct - bench_pct
+            col_c2.metric(f"{benchmark_opt} ({period_label})", f"{bench_pct:+.2f}%")
+            col_c3.metric("⚖️ Alpha", f"{diff:+.2f}%", delta_color="normal")
         else:
-            col_c2.metric(f"📉 IFIX ({period_label})", "Indisponível")
+            col_c2.metric(benchmark_opt, "Indisponível")
             col_c3.metric("⚖️ Alpha", "—")
 
-        if hist_ifix is not None and not hist_ifix.empty:
-            hist_ifix_norm = hist_ifix.copy()
-            hist_ifix_norm["IFIX (base 100)"] = hist_ifix_norm["Close"] / hist_ifix_norm["Close"].iloc[0] * 100
-
+        if hist_bench is not None and not hist_bench.empty:
+            hist_norm = hist_bench.copy()
+            hist_norm["Base 100"] = hist_norm["Close"] / hist_norm["Close"].iloc[0] * 100
             fig_comp = go.Figure()
             fig_comp.add_trace(go.Scatter(
-                x=hist_ifix_norm["Date"],
-                y=hist_ifix_norm["IFIX (base 100)"],
-                name="IFIX",
-                line=dict(color="darkorange", width=2),
-                hovertemplate="<b>IFIX</b><br>%{x}<br>Base 100: %{y:.1f}<extra></extra>",
+                x=hist_norm["Date"], y=hist_norm["Base 100"],
+                name=benchmark_opt, line=dict(color="darkorange", width=2),
+                hovertemplate=f"<b>{benchmark_opt}</b><br>%{{x}}<br>Base 100: %{{y:.1f}}<extra></extra>",
             ))
-            # Linha da carteira como valor constante (variação acumulada desde PM)
-            if len(hist_ifix_norm) >= 2:
-                carteira_base100 = 100 + carteira_pct
-                fig_comp.add_hline(
-                    y=carteira_base100,
-                    line_dash="dash",
-                    line_color="royalblue",
-                    annotation_text=f"Sua carteira: {carteira_base100:.1f}",
-                    annotation_position="right",
-                )
-            fig_comp.update_layout(
-                title=f"IFIX — últimos {period_label} (base 100)",
-                xaxis=dict(title="Data"),
-                yaxis=dict(title="Base 100"),
-                height=350,
-                margin=dict(t=40, b=0, l=0, r=10),
+            fig_comp.add_hline(
+                y=100 + carteira_pct, line_dash="dash", line_color="royalblue",
+                annotation_text=f"Sua carteira: {100 + carteira_pct:.1f}", annotation_position="right",
             )
+            fig_comp.update_layout(title=f"{benchmark_opt} — {period_label} (base 100)",
+                                   xaxis=dict(title="Data"), yaxis=dict(title="Base 100"),
+                                   height=350, margin=dict(t=40, b=0, l=0, r=10))
             st.plotly_chart(fig_comp, use_container_width=True)
-            st.caption("⚠️ Rentabilidade da carteira calculada com base no preço médio de compra (PM). IFIX via yfinance.")
+            st.caption("⚠️ Rentabilidade da carteira calculada vs PM de compra.")
 
-        # ---- Exportação CSV ----
+        # ---- Exportação ----
         st.markdown("---")
         st.subheader("⬇️ Exportar Carteira")
-
-        df_export = df.drop(columns=["_peso"], errors="ignore").copy()
+        df_export = df.copy()
         df_export["Data exportação"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-
         csv_bytes = df_export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
         st.download_button(
             label="📥 Baixar carteira em CSV",
             data=csv_bytes,
-            file_name=f"carteira_fiis_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            file_name=f"carteira_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
         )
 
         # ---- Resumo Fiscal ----
         st.markdown("---")
         st.subheader("🧾 Resumo Fiscal")
-        st.caption("FIIs são isentos de IR sobre dividendos para pessoas físicas. O IR incide apenas sobre ganho de capital na venda de cotas.")
 
-        df_fiscal = df[["Ticker", "Qtde", "PM", "Preço Atual", "Valor de Mercado"]].copy()
-        df_fiscal["Custo Total (R$)"] = df_fiscal["Qtde"] * df_fiscal["PM"]
-        df_fiscal["Ganho de Capital (R$)"] = df_fiscal["Valor de Mercado"] - df_fiscal["Custo Total (R$)"]
-        df_fiscal["Ganho (%)"] = (df_fiscal["Ganho de Capital (R$)"] / df_fiscal["Custo Total (R$)"]).where(
-            df_fiscal["Custo Total (R$)"] > 0, 0
-        ) * 100
-        df_fiscal["IR estimado (20%)"] = df_fiscal["Ganho de Capital (R$)"].apply(lambda x: x * 0.20 if x > 0 else 0.0)
+        df_fiscal = df[["Ticker", "Tipo", "Qtde", "PM (R$)", "Preço Atual (R$)", "Valor de Mercado (R$)"]].copy()
+        df_fiscal["Custo Total (R$)"] = df_fiscal["Qtde"] * df_fiscal["PM (R$)"]
+        df_fiscal["Ganho de Capital (R$)"] = df_fiscal["Valor de Mercado (R$)"] - df_fiscal["Custo Total (R$)"]
+        df_fiscal["Ganho (%)"] = (
+            df_fiscal["Ganho de Capital (R$)"] / df_fiscal["Custo Total (R$)"]
+        ).where(df_fiscal["Custo Total (R$)"] > 0, 0) * 100
 
-        total_custo = df_fiscal["Custo Total (R$)"].sum()
-        total_ganho = df_fiscal["Ganho de Capital (R$)"].sum()
-        total_ir = df_fiscal["IR estimado (20%)"].sum()
+        def ir_estimado(row):
+            cfg = ASSET_CONFIG.get(row["Tipo"], ASSET_CONFIG["Ação"])
+            ganho = row["Ganho de Capital (R$)"]
+            return ganho * cfg["ir_ganho"] if ganho > 0 else 0.0
+
+        df_fiscal["Alíquota IR"] = df_fiscal["Tipo"].map(
+            lambda t: f"{ASSET_CONFIG.get(t, ASSET_CONFIG['Ação'])['ir_ganho']*100:.0f}%"
+        )
+        df_fiscal["IR estimado (R$)"] = df_fiscal.apply(ir_estimado, axis=1)
 
         col_f1, col_f2, col_f3 = st.columns(3)
-        col_f1.metric("💸 Custo total", f"R$ {total_custo:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-        sinal = "+" if total_ganho >= 0 else ""
-        col_f2.metric("📈 Ganho de capital latente", f"{sinal}R$ {total_ganho:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-        col_f3.metric("🏦 IR latente (20% sobre ganho)", f"R$ {total_ir:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        col_f1.metric("💸 Custo total", brl(df_fiscal["Custo Total (R$)"].sum()))
+        ganho_total = df_fiscal["Ganho de Capital (R$)"].sum()
+        col_f2.metric("📈 Ganho latente", f"{'+' if ganho_total >= 0 else ''}{brl(ganho_total)}")
+        col_f3.metric("🏦 IR latente estimado", brl(df_fiscal["IR estimado (R$)"].sum()))
 
-        st.dataframe(df_fiscal.drop(columns=["PM", "Preço Atual", "Valor de Mercado"]).style.format({
+        with st.expander("ℹ️ Sobre alíquotas"):
+            st.markdown("""
+            - **FIIs:** 20% sobre ganho de capital na venda. Dividendos **isentos** para pessoa física.
+            - **Ações:** 15% (swing trade) ou 20% (day trade) sobre ganho de capital. Dividendos **isentos** (Lei 9.249/95).
+            - **ETFs:** 15% sobre ganho de capital. Sem isenção mensal.
+            - Isenção de IR para vendas de ações ≤ R$ 20.000/mês não está calculada aqui.
+            """)
+
+        st.dataframe(df_fiscal.drop(columns=["PM (R$)", "Preço Atual (R$)", "Valor de Mercado (R$)"]).style.format({
             "Custo Total (R$)": "R$ {:.2f}",
             "Ganho de Capital (R$)": "R$ {:.2f}",
-            "Ganho (%)": "{:.2f}%",
-            "IR estimado (20%)": "R$ {:.2f}",
-        }).applymap(lambda v: "color: green" if isinstance(v, (int, float)) and v > 0 else (
-            "color: red" if isinstance(v, (int, float)) and v < 0 else ""
-        ), subset=["Ganho de Capital (R$)", "Ganho (%)"]), use_container_width=True)
+            "Ganho (%)": "{:+.2f}%",
+            "IR estimado (R$)": "R$ {:.2f}",
+        }), use_container_width=True)
 
-        # ---- Histórico de Proventos ----
+        # ---- Proventos ----
         st.markdown("---")
-        st.subheader("💰 Histórico de Proventos Recebidos")
-
+        st.subheader("💰 Histórico de Proventos / Dividendos")
         proventos = load_proventos()
 
         with st.expander("➕ Registrar novo provento", expanded=False):
@@ -839,68 +781,51 @@ def page_portfolio(dy_min=6.0, dy_max=15.0):
             with col_p2:
                 p_data = st.date_input("Data de pagamento", key="p_data")
             with col_p3:
-                p_valor = st.number_input("Valor por cota (R$)", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="p_valor")
+                p_valor = st.number_input("Valor por cota (R$)", min_value=0.0, value=0.0,
+                                          step=0.0001, format="%.4f", key="p_valor")
             with col_p4:
-                p_qtd_default = int(df[df["Ticker"] == p_ticker]["Qtde"].values[0]) if p_ticker in df["Ticker"].values else 1
-                p_qtd = st.number_input("Quantidade de cotas", min_value=1, value=p_qtd_default, step=1, key="p_qtd")
+                qtd_default = int(df[df["Ticker"] == p_ticker]["Qtde"].values[0]) if p_ticker in df["Ticker"].values else 1
+                p_qtd = st.number_input("Qtde de cotas", min_value=1, value=qtd_default, step=1, key="p_qtd")
             if st.button("💾 Salvar provento"):
                 if p_valor > 0:
                     add_provento(p_ticker, str(p_data), p_valor, p_qtd)
-                    st.success(f"✅ Provento de R$ {p_valor * p_qtd:.2f} registrado para {p_ticker}!")
+                    st.success(f"✅ Provento de {brl(p_valor * p_qtd)} registrado para {p_ticker}!")
                     st.rerun()
                 else:
                     st.error("❌ Informe um valor por cota maior que zero.")
 
         if proventos:
-            df_prov = pd.DataFrame(proventos)
-            df_prov = df_prov.rename(columns={
+            df_prov = pd.DataFrame(proventos).rename(columns={
                 "ticker": "Ticker", "data": "Data", "valor_por_cota": "R$/Cota",
-                "quantidade": "Qtde", "total": "Total (R$)"
+                "quantidade": "Qtde", "total": "Total (R$)",
             })
-            total_proventos = df_prov["Total (R$)"].sum()
-            st.metric("💵 Total recebido em proventos", f"R$ {total_proventos:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-            # Gráfico de proventos por mês
+            st.metric("💵 Total recebido em proventos", brl(df_prov["Total (R$)"].sum()))
             df_prov["Mês"] = pd.to_datetime(df_prov["Data"]).dt.to_period("M").astype(str)
             df_mensal = df_prov.groupby("Mês")["Total (R$)"].sum().reset_index().sort_values("Mês")
             fig_prov = go.Figure(go.Bar(
-                x=df_mensal["Mês"],
-                y=df_mensal["Total (R$)"],
+                x=df_mensal["Mês"], y=df_mensal["Total (R$)"],
                 marker_color="seagreen",
                 text=df_mensal["Total (R$)"].apply(lambda v: f"R$ {v:,.2f}"),
                 textposition="outside",
                 hovertemplate="<b>%{x}</b><br>R$ %{y:,.2f}<extra></extra>",
             ))
-            fig_prov.update_layout(
-                title="Proventos recebidos por mês (R$)",
-                xaxis=dict(title="Mês"),
-                yaxis=dict(title="R$"),
-                height=300,
-                margin=dict(t=40, b=0, l=0, r=0),
-            )
+            fig_prov.update_layout(title="Proventos por mês (R$)", height=300,
+                                   xaxis=dict(title="Mês"), yaxis=dict(title="R$"),
+                                   margin=dict(t=40, b=0, l=0, r=0))
             st.plotly_chart(fig_prov, use_container_width=True)
-
-            st.dataframe(df_prov.style.format({
-                "R$/Cota": "R$ {:.4f}",
-                "Total (R$)": "R$ {:.2f}",
+            st.dataframe(df_prov.drop(columns=["Mês"]).style.format({
+                "R$/Cota": "R$ {:.4f}", "Total (R$)": "R$ {:.2f}",
             }), use_container_width=True)
-
-            # Exportar proventos
-            csv_prov = df_prov.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-            st.download_button(
-                label="📥 Baixar proventos em CSV",
-                data=csv_prov,
-                file_name=f"proventos_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-                key="dl_proventos",
-            )
+            csv_prov = df_prov.drop(columns=["Mês"]).to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button("📥 Baixar proventos em CSV", data=csv_prov,
+                               file_name=f"proventos_{datetime.now().strftime('%Y%m%d')}.csv",
+                               mime="text/csv", key="dl_proventos")
         else:
-            st.info("📭 Nenhum provento registrado ainda. Use o formulário acima para registrar.")
+            st.info("📭 Nenhum provento registrado ainda. Use o formulário acima.")
 
-    else:
-        st.info("📭 Sua carteira está vazia. Adicione FIIs na aba 'Explorar FIIs'.")
-
-    st.subheader("✏️ Remover/Atualizar posição")
+    # ---- Operações ----
+    st.markdown("---")
+    st.subheader("✏️ Registrar Operação")
     if df.empty:
         return
 
@@ -909,7 +834,7 @@ def page_portfolio(dy_min=6.0, dy_max=15.0):
     with col1:
         t_sel = st.selectbox("Ticker", tickers)
     with col2:
-        qty_add = st.number_input("Adicionar quantidade (positivo compra, negativo venda)", value=0, step=1)
+        qty_add = st.number_input("Quantidade (+ compra / - venda)", value=0, step=1)
     with col3:
         price_op = st.number_input("Preço da operação (R$)", value=0.0, step=0.1, format="%.2f")
 
@@ -922,36 +847,25 @@ def page_portfolio(dy_min=6.0, dy_max=15.0):
             st.success("✅ Operação aplicada!")
             st.rerun()
         else:
-            st.error("❌ Informe ticker, quantidade diferente de zero e preço válido.")
+            st.error("❌ Informe quantidade diferente de zero e preço válido.")
+
+# ============= PÁGINA: PROJEÇÕES =============
 
 def page_projection():
     st.header("🎯 Projeções para Independência Financeira")
-    
-    # Explicação sobre Independência Financeira
-    with st.expander("ℹ️ O que é Independência Financeira?", expanded=False):
+
+    with st.expander("ℹ️ Como funciona o cálculo?", expanded=False):
         st.markdown("""
-        ### 📚 Entenda a Independência Financeira
-        
-        **Independência Financeira (IF)** é quando sua renda passiva (dividendos, aluguéis, etc.) 
-        cobre todas as suas despesas mensais, permitindo que você não precise trabalhar para viver.
-        
-        #### 🧮 Como funciona o cálculo:
-        
-        1. **💰 Patrimônio Atual**: Quanto você tem investido hoje em FIIs
-        2. **📈 Renda Mensal Atual**: Quanto seus FIIs pagam de dividendos por mês hoje
-        3. **💵 Aporte Mensal**: Quanto você vai investir todo mês
-        4. **🎯 Meta de Renda Mensal**: Quanto você precisa receber por mês para ser independente
-        
-        #### 📊 Parâmetros de Crescimento:
-        
-        - **Valorização do Patrimônio**: Quanto seus FIIs vão valorizar por ano (média histórica: 6%)
-        - **Crescimento dos Dividendos**: Quanto os dividendos vão aumentar por ano (média: 2-4%)
-        - **Crescimento do Aporte**: Se você planeja aumentar seus aportes anualmente (ex: acompanhar inflação)
-        
-        #### 💡 Exemplo Prático:
-        
-        Se você tem R$ 50.000 investidos, recebe R$ 400/mês de dividendos, aporta R$ 1.000/mês 
-        e precisa de R$ 5.000/mês para viver, o simulador calcula em quanto tempo você chegará lá!
+        ### 📚 Independência Financeira
+        **IF** é quando sua renda passiva (dividendos, rendimentos) cobre todas as despesas mensais.
+
+        #### 🧮 Parâmetros:
+        - **Patrimônio e renda atuais** — carregados da sua carteira automaticamente
+        - **Aporte mensal** — quanto você investe por mês
+        - **Meta de renda** — quanto você precisa por mês para viver de renda
+        - **Valorização anual** — crescimento esperado dos ativos (histórico IFIX/IBOV: ~6-8%)
+        - **Crescimento dos dividendos** — crescimento anual dos rendimentos (média: 2-4%)
+        - **Crescimento do aporte** — se você vai aumentar aportes anualmente (ex: reajuste salarial)
         """)
 
     portfolio = load_portfolio()
@@ -960,65 +874,22 @@ def page_projection():
     start_capital = totals["Patrimônio (R$)"]
     current_monthly_income = totals["Renda Mensal (R$)"]
 
-    st.write(f"💰 **Patrimônio atual:** R$ {start_capital:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    st.write(f"📈 **Renda mensal atual estimada:** R$ {current_monthly_income:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
+    st.write(f"💰 **Patrimônio atual:** {brl(start_capital)}")
+    st.write(f"📈 **Renda mensal estimada:** {brl(current_monthly_income)}")
     st.markdown("---")
     st.subheader("⚙️ Configurar Simulação")
-    
+
     col = st.columns(2)
     with col[0]:
         st.markdown("##### 💵 Aportes e Metas")
-        monthly_contribution = st.number_input(
-            "💵 Aporte mensal (R$)", 
-            min_value=0.0, 
-            value=1000.0, 
-            step=100.0, 
-            format="%.2f",
-            help="Quanto você vai investir todo mês em FIIs"
-        )
-        target_income = st.number_input(
-            "🎯 Meta de renda mensal para IF (R$)", 
-            min_value=0.0, 
-            value=5000.0, 
-            step=100.0, 
-            format="%.2f",
-            help="Quanto você precisa receber por mês para cobrir suas despesas e ser independente financeiramente"
-        )
-        yearly_return = st.number_input(
-            "📊 Valorização anual do patrimônio (%)", 
-            min_value=-50.0, 
-            value=6.0, 
-            step=0.5, 
-            format="%.2f",
-            help="Quanto você espera que seus FIIs valorizem por ano. Média histórica do IFIX: 6% ao ano"
-        ) / 100.0
-        
+        monthly_contribution = st.number_input("Aporte mensal (R$)", min_value=0.0, value=1000.0, step=100.0, format="%.2f")
+        target_income = st.number_input("Meta de renda mensal para IF (R$)", min_value=0.0, value=5000.0, step=100.0, format="%.2f")
+        yearly_return = st.number_input("Valorização anual do patrimônio (%)", min_value=-50.0, value=6.0, step=0.5, format="%.2f") / 100.0
     with col[1]:
         st.markdown("##### 📈 Crescimento e Horizonte")
-        yearly_div_growth = st.number_input(
-            "📈 Crescimento anual dos dividendos (%)", 
-            min_value=-50.0, 
-            value=2.0, 
-            step=0.5, 
-            format="%.2f",
-            help="Quanto você espera que os dividendos cresçam por ano. Média histórica: 2-4% ao ano"
-        ) / 100.0
-        yearly_contrib_growth = st.number_input(
-            "💰 Crescimento anual do aporte (%)", 
-            min_value=-50.0, 
-            value=0.0, 
-            step=0.5, 
-            format="%.2f",
-            help="Se você planeja aumentar seus aportes anualmente (ex: 5% para acompanhar aumentos salariais)"
-        ) / 100.0
-        max_years = st.slider(
-            "⏳ Horizonte (anos)", 
-            min_value=1, 
-            max_value=50, 
-            value=30,
-            help="Por quantos anos você quer simular o crescimento do seu patrimônio"
-        )
+        yearly_div_growth = st.number_input("Crescimento anual dos dividendos (%)", min_value=-50.0, value=2.0, step=0.5, format="%.2f") / 100.0
+        yearly_contrib_growth = st.number_input("Crescimento anual do aporte (%)", min_value=-50.0, value=0.0, step=0.5, format="%.2f") / 100.0
+        max_years = st.slider("Horizonte (anos)", min_value=1, max_value=50, value=30)
 
     if st.button("🚀 Simular", type="primary"):
         with st.spinner("Calculando projeções..."):
@@ -1030,103 +901,72 @@ def page_projection():
                 yearly_return=yearly_return,
                 yearly_dividend_growth=yearly_div_growth,
                 yearly_contrib_growth=yearly_contrib_growth,
-                max_years=max_years
+                max_years=max_years,
             )
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=df_sim["Data"], 
-                y=df_sim["Patrimônio (R$)"], 
-                name="Patrimônio (R$)", 
-                line=dict(color="royalblue", width=3),
-                hovertemplate='<b>Data:</b> %{x}<br><b>Patrimônio:</b> R$ %{y:,.2f}<extra></extra>'
-            ))
-            fig.add_trace(go.Scatter(
-                x=df_sim["Data"], 
-                y=df_sim["Renda Mensal (R$)"], 
-                name="Renda Mensal (R$)", 
-                line=dict(color="seagreen", width=3), 
-                yaxis="y2",
-                hovertemplate='<b>Data:</b> %{x}<br><b>Renda:</b> R$ %{y:,.2f}<extra></extra>'
-            ))
-            
-            # Adicionar linha da meta
-            fig.add_hline(
-                y=target_income, 
-                line_dash="dash", 
-                line_color="red", 
-                annotation_text=f"Meta: R$ {target_income:,.2f}",
-                annotation_position="right",
-                yref="y2"
-            )
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df_sim["Data"], y=df_sim["Patrimônio (R$)"], name="Patrimônio (R$)",
+            line=dict(color="royalblue", width=3),
+            hovertemplate="<b>Data:</b> %{x}<br><b>Patrimônio:</b> R$ %{y:,.2f}<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=df_sim["Data"], y=df_sim["Renda Mensal (R$)"], name="Renda Mensal (R$)",
+            line=dict(color="seagreen", width=3), yaxis="y2",
+            hovertemplate="<b>Data:</b> %{x}<br><b>Renda:</b> R$ %{y:,.2f}<extra></extra>",
+        ))
+        fig.add_hline(y=target_income, line_dash="dash", line_color="red",
+                      annotation_text=f"Meta: R$ {target_income:,.2f}", annotation_position="right", yref="y2")
+        fig.update_layout(
+            title="📊 Projeção de Patrimônio e Renda Mensal",
+            xaxis=dict(title="Data"),
+            yaxis=dict(title="Patrimônio (R$)", side="left", showgrid=True),
+            yaxis2=dict(title="Renda Mensal (R$)", overlaying="y", side="right", showgrid=False),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="x unified", height=600,
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-            fig.update_layout(
-                title="📊 Projeção de Patrimônio e Renda Mensal",
-                xaxis=dict(title="Data"),
-                yaxis=dict(title="Patrimônio (R$)", side="left", showgrid=True),
-                yaxis2=dict(title="Renda Mensal (R$)", overlaying="y", side="right", showgrid=False),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                hovermode='x unified',
-                height=600
-            )
-            st.plotly_chart(fig, use_container_width=True)
+        if months_to_goal is not None:
+            years, months = months_to_goal // 12, months_to_goal % 12
+            st.success(f"🎉 **Independência financeira estimada em {years} ano(s) e {months} mês(es)!**")
+            idx = min(months_to_goal, len(df_sim) - 1)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("💰 Patrimônio na IF", brl(df_sim["Patrimônio (R$)"].iloc[idx]))
+            col2.metric("📈 Renda Mensal na IF", brl(df_sim["Renda Mensal (R$)"].iloc[idx]))
+            col3.metric("⏱️ Tempo até IF", f"{years}a {months}m")
+        else:
+            st.warning("⚠️ Meta não atingida dentro do horizonte selecionado.")
+            st.info("💡 **Sugestões:** Aumente o aporte mensal, o horizonte de tempo ou revise a meta.")
+            col1, col2 = st.columns(2)
+            col1.metric(f"💰 Patrimônio em {max_years} anos", brl(df_sim["Patrimônio (R$)"].iloc[-1]))
+            col2.metric(f"📈 Renda em {max_years} anos", brl(df_sim["Renda Mensal (R$)"].iloc[-1]))
 
-            if months_to_goal is not None:
-                years = months_to_goal // 12
-                months = months_to_goal % 12
-                st.success(f"🎉 **Independência financeira estimada em {years} ano(s) e {months} mês(es)**!")
-                st.info(f"📅 Você atingirá sua meta de R$ {target_income:,.2f}/mês de renda passiva!".replace(",", "X").replace(".", ",").replace("X", "."))
-                
-                # Mostrar resumo final
-                final_wealth = df_sim["Patrimônio (R$)"].iloc[-1] if months_to_goal < len(df_sim) else df_sim["Patrimônio (R$)"].iloc[months_to_goal]
-                final_income = df_sim["Renda Mensal (R$)"].iloc[-1] if months_to_goal < len(df_sim) else df_sim["Renda Mensal (R$)"].iloc[months_to_goal]
-                
-                col1, col2, col3 = st.columns(3)
-                col1.metric("💰 Patrimônio Final", f"R$ {final_wealth:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-                col2.metric("📈 Renda Mensal Final", f"R$ {final_income:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-                col3.metric("⏱️ Tempo até IF", f"{years}a {months}m")
-                
-            else:
-                st.warning("⚠️ Meta não atingida dentro do horizonte selecionado.")
-                st.info("💡 **Sugestões:**\n- Aumente o aporte mensal\n- Aumente o horizonte de tempo\n- Revise sua meta de renda mensal")
-                
-                # Mostrar onde chegaria
-                final_wealth = df_sim["Patrimônio (R$)"].iloc[-1]
-                final_income = df_sim["Renda Mensal (R$)"].iloc[-1]
-                
-                col1, col2 = st.columns(2)
-                col1.metric("💰 Patrimônio em " + str(max_years) + " anos", f"R$ {final_wealth:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-                col2.metric("📈 Renda Mensal em " + str(max_years) + " anos", f"R$ {final_income:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+# ============= MAIN =============
 
 def main():
-    st.sidebar.title("📊 Dashboard FIIs IFIX")
+    st.sidebar.title("📊 Dashboard Investimentos BR")
     st.sidebar.markdown("---")
-    page = st.sidebar.radio("🧭 Navegação", ["🔍 Explorar FIIs", "💼 Minha Carteira", "🎯 Projeções"])
+    page = st.sidebar.radio("🧭 Navegação", ["🔍 Explorar Ativos", "💼 Minha Carteira", "🎯 Projeções"])
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🔔 Alertas de DY")
-    dy_min = st.sidebar.number_input(
-        "DY mínimo (%)", min_value=0.0, max_value=50.0, value=6.0, step=0.5, format="%.1f",
-        help="FIIs abaixo deste DY serão destacados em vermelho na carteira"
-    )
-    dy_max = st.sidebar.number_input(
-        "DY máximo (%)", min_value=0.0, max_value=100.0, value=15.0, step=0.5, format="%.1f",
-        help="FIIs acima deste DY serão destacados em laranja (possível sinal de risco)"
-    )
+    st.sidebar.markdown("### 🔔 Alertas de DY/Yield")
+    dy_min = st.sidebar.number_input("DY mínimo (%)", min_value=0.0, max_value=50.0, value=6.0, step=0.5, format="%.1f",
+                                      help="Destaque vermelho para ativos abaixo deste DY")
+    dy_max = st.sidebar.number_input("DY máximo (%)", min_value=0.0, max_value=100.0, value=15.0, step=0.5, format="%.1f",
+                                      help="Destaque amarelo para DY muito alto (possível risco)")
 
     st.sidebar.markdown("---")
     st.sidebar.success("✅ **Conectado à Brapi**")
-    st.sidebar.info("💡 **Preços:** Brapi")
-    st.sidebar.info("📊 **DY:** Funds Explorer + Status Invest")
+    st.sidebar.info("💡 **Preços:** Brapi REST API")
+    st.sidebar.info("📊 **DY:** FundsExplorer + StatusInvest")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📚 Sobre")
-    st.sidebar.markdown("Dashboard para controle de investimentos em FIIs brasileiros.")
-    st.sidebar.markdown("**Fontes de dados:**")
-    st.sidebar.markdown("- Preços: [Brapi](https://brapi.dev)")
-    st.sidebar.markdown("- DY: [Funds Explorer](https://fundsexplorer.com.br) + [Status Invest](https://statusinvest.com.br)")
+    st.sidebar.markdown("Dashboard de investimentos brasileiros: FIIs, Ações e ETFs.")
+    st.sidebar.markdown("**Fontes:** [Brapi](https://brapi.dev) · [FundsExplorer](https://fundsexplorer.com.br) · [StatusInvest](https://statusinvest.com.br)")
 
-    if page == "🔍 Explorar FIIs":
+    if page == "🔍 Explorar Ativos":
         page_explore()
     elif page == "💼 Minha Carteira":
         page_portfolio(dy_min=dy_min, dy_max=dy_max)
