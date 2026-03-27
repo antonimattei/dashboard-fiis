@@ -9,22 +9,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from unittest.mock import patch
-
-with (
-    patch("streamlit.set_page_config"),
-    patch("streamlit.error"),
-    patch("streamlit.stop"),
-    patch("brapi.Brapi"),
-    patch("dotenv.load_dotenv"),
-    patch.dict(os.environ, {"BRAPI_API_KEY": "fake-key-for-tests"}),
-):
-    import app as _app
-
-upsert_position = _app.upsert_position
-clean_positions = _app.clean_positions
-simulate_projection = _app.simulate_projection
-classify_ticker = _app.classify_ticker
+from data_layer.portfolio import upsert_position, clean_positions, save_portfolio, load_portfolio
+from data_layer.assets import classify_ticker
+from data_layer.proventos import add_provento, load_proventos
+from utils import simulate_projection
+import data_layer.portfolio as _portfolio_mod
+import data_layer.proventos as _proventos_mod
 
 
 # ============= Helpers =============
@@ -183,25 +173,25 @@ class TestSimulateProjection:
 
 class TestPortfolioIO:
     def test_salva_e_carrega_portfolio(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(_app, "PORTFOLIO_JSON", str(tmp_path / "portfolio.json"))
-        monkeypatch.setattr(_app, "DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(_portfolio_mod, "PORTFOLIO_JSON", str(tmp_path / "portfolio.json"))
+        monkeypatch.setattr(_portfolio_mod, "DATA_DIR", str(tmp_path))
         pf = {"positions": [_pos("HGLG11", 10, 100.0)]}
-        _app.save_portfolio(pf)
-        loaded = _app.load_portfolio()
+        save_portfolio(pf)
+        loaded = load_portfolio()
         assert loaded["positions"][0]["ticker"] == "HGLG11"
         assert loaded["positions"][0]["quantity"] == 10
 
     def test_carrega_portfolio_inexistente_retorna_vazio(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(_app, "PORTFOLIO_JSON", str(tmp_path / "nao_existe.json"))
-        loaded = _app.load_portfolio()
+        monkeypatch.setattr(_portfolio_mod, "PORTFOLIO_JSON", str(tmp_path / "nao_existe.json"))
+        loaded = load_portfolio()
         assert loaded == {"positions": []}
 
     def test_carrega_portfolio_corrompido_retorna_vazio(self, tmp_path, monkeypatch):
         json_path = tmp_path / "portfolio.json"
         json_path.write_text("INVALID JSON {{{", encoding="utf-8")
-        monkeypatch.setattr(_app, "PORTFOLIO_JSON", str(json_path))
-        monkeypatch.setattr(_app, "DATA_DIR", str(tmp_path))
-        loaded = _app.load_portfolio()
+        monkeypatch.setattr(_portfolio_mod, "PORTFOLIO_JSON", str(json_path))
+        monkeypatch.setattr(_portfolio_mod, "DATA_DIR", str(tmp_path))
+        loaded = load_portfolio()
         assert loaded == {"positions": []}
 
 
@@ -209,22 +199,22 @@ class TestPortfolioIO:
 
 class TestProventosIO:
     def test_salva_e_carrega_provento(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(_app, "PROVENTOS_JSON", str(tmp_path / "proventos.json"))
-        monkeypatch.setattr(_app, "DATA_DIR", str(tmp_path))
-        _app.add_provento("HGLG11", "2026-03-01", 0.85, 100)
-        proventos = _app.load_proventos()
+        monkeypatch.setattr(_proventos_mod, "PROVENTOS_JSON", str(tmp_path / "proventos.json"))
+        monkeypatch.setattr(_proventos_mod, "DATA_DIR", str(tmp_path))
+        add_provento("HGLG11", "2026-03-01", 0.85, 100)
+        proventos = load_proventos()
         assert len(proventos) == 1
         assert proventos[0]["ticker"] == "HGLG11"
         assert proventos[0]["total"] == pytest.approx(85.0)
 
     def test_proventos_ordenados_por_data_desc(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(_app, "PROVENTOS_JSON", str(tmp_path / "proventos.json"))
-        monkeypatch.setattr(_app, "DATA_DIR", str(tmp_path))
-        _app.add_provento("HGLG11", "2026-01-01", 0.80, 10)
-        _app.add_provento("KNRI11", "2026-03-01", 0.90, 10)
-        proventos = _app.load_proventos()
+        monkeypatch.setattr(_proventos_mod, "PROVENTOS_JSON", str(tmp_path / "proventos.json"))
+        monkeypatch.setattr(_proventos_mod, "DATA_DIR", str(tmp_path))
+        add_provento("HGLG11", "2026-01-01", 0.80, 10)
+        add_provento("KNRI11", "2026-03-01", 0.90, 10)
+        proventos = load_proventos()
         assert proventos[0]["data"] > proventos[1]["data"]
 
     def test_carrega_proventos_inexistente_retorna_vazio(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(_app, "PROVENTOS_JSON", str(tmp_path / "nao_existe.json"))
-        assert _app.load_proventos() == []
+        monkeypatch.setattr(_proventos_mod, "PROVENTOS_JSON", str(tmp_path / "nao_existe.json"))
+        assert load_proventos() == []
