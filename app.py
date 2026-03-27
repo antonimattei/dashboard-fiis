@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+import time
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
@@ -12,6 +14,19 @@ from brapi import Brapi
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ============= LOGGING =============
+
+os.makedirs("data", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("data/dashboard.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 BRAPI_API_KEY = os.getenv("BRAPI_API_KEY")
 
@@ -31,15 +46,24 @@ st.set_page_config(page_title="Dashboard FIIs IFIX", layout="wide")
 
 @st.cache_data(ttl=60*30)
 def get_last_price(ticker):
-    """Busca último preço via Brapi"""
-    try:
-        quote = client.quote.retrieve(tickers=ticker)
-        if quote.results and len(quote.results) > 0:
-            result = quote.results[0]
-            if hasattr(result, 'regular_market_price') and result.regular_market_price:
-                return float(result.regular_market_price)
-    except Exception as e:
-        pass
+    """Busca último preço via Brapi com retry (3 tentativas)"""
+    for attempt in range(3):
+        try:
+            quote = client.quote.retrieve(tickers=ticker)
+            if quote.results and len(quote.results) > 0:
+                result = quote.results[0]
+                if hasattr(result, 'regular_market_price') and result.regular_market_price:
+                    price = float(result.regular_market_price)
+                    logger.info("Preço obtido: %s = R$ %.2f", ticker, price)
+                    return price
+            logger.warning("Preço não encontrado na resposta Brapi para %s", ticker)
+            return None
+        except Exception as e:
+            wait = 2 ** attempt
+            logger.warning("Tentativa %d/3 falhou ao buscar preço de %s: %s. Aguardando %ds...", attempt + 1, ticker, e, wait)
+            if attempt < 2:
+                time.sleep(wait)
+    logger.error("Todas as tentativas falharam ao buscar preço de %s", ticker)
     return None
 
 # ============= FUNÇÕES DE DIVIDENDOS (API ALTERNATIVA GRATUITA FUNDSEXPLORER) =============
@@ -52,13 +76,25 @@ def get_dy_from_fundsexplorer(ticker):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        
+
+        response = None
+        for attempt in range(3):
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                break
+            except requests.RequestException as req_err:
+                wait = 2 ** attempt
+                logger.warning("FundsExplorer tentativa %d/3 para %s: %s. Aguardando %ds...", attempt + 1, ticker, req_err, wait)
+                if attempt < 2:
+                    time.sleep(wait)
+        if response is None:
+            logger.error("FundsExplorer: todas as tentativas falharam para %s", ticker)
+            return None
+
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'html.parser')
             dy_elements = soup.find_all('span', class_='indicator-value')
-            
+
             for elem in dy_elements:
                 text = elem.get_text().strip()
                 if '%' in text:
@@ -66,10 +102,11 @@ def get_dy_from_fundsexplorer(ticker):
                         dy_str = text.replace('%', '').replace(',', '.').strip()
                         dy_value = float(dy_str)
                         if 0 < dy_value < 50:
+                            logger.info("DY FundsExplorer: %s = %.2f%%", ticker, dy_value)
                             return dy_value / 100
                     except:
                         continue
-            
+
             tables = soup.find_all('table')
             for table in tables:
                 rows = table.find_all('tr')
@@ -83,11 +120,15 @@ def get_dy_from_fundsexplorer(ticker):
                                     dy_str = dy_text.replace('%', '').replace(',', '.').strip()
                                     dy_value = float(dy_str)
                                     if 0 < dy_value < 50:
+                                        logger.info("DY FundsExplorer (tabela): %s = %.2f%%", ticker, dy_value)
                                         return dy_value / 100
                                 except:
                                     continue
+        else:
+            logger.warning("FundsExplorer retornou HTTP %d para %s", response.status_code, ticker)
     except Exception as e:
-        pass
+        logger.warning("Erro ao buscar DY do FundsExplorer para %s: %s", ticker, e)
+    logger.debug("DY não encontrado no FundsExplorer para %s", ticker)
     return None
 
 @st.cache_data(ttl=60*60*24)
@@ -98,15 +139,25 @@ def get_dy_from_statusinvest(ticker):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        
+
+        response = None
+        for attempt in range(3):
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                break
+            except requests.RequestException as req_err:
+                wait = 2 ** attempt
+                logger.warning("StatusInvest tentativa %d/3 para %s: %s. Aguardando %ds...", attempt + 1, ticker, req_err, wait)
+                if attempt < 2:
+                    time.sleep(wait)
+        if response is None:
+            logger.error("StatusInvest: todas as tentativas falharam para %s", ticker)
+            return None
+
         if response.status_code == 200:
             soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Procurar pelo DY no Status Invest
+
             dy_divs = soup.find_all('div', class_='value')
-            
             for div in dy_divs:
                 text = div.get_text().strip()
                 if '%' in text:
@@ -114,11 +165,11 @@ def get_dy_from_statusinvest(ticker):
                         dy_str = text.replace('%', '').replace(',', '.').strip()
                         dy_value = float(dy_str)
                         if 0 < dy_value < 50:
+                            logger.info("DY StatusInvest: %s = %.2f%%", ticker, dy_value)
                             return dy_value / 100
                     except:
                         continue
-            
-            # Procurar em strong tags
+
             strong_tags = soup.find_all('strong', class_='value')
             for tag in strong_tags:
                 text = tag.get_text().strip()
@@ -127,11 +178,15 @@ def get_dy_from_statusinvest(ticker):
                         dy_str = text.replace('%', '').replace(',', '.').strip()
                         dy_value = float(dy_str)
                         if 0 < dy_value < 50:
+                            logger.info("DY StatusInvest (strong): %s = %.2f%%", ticker, dy_value)
                             return dy_value / 100
                     except:
                         continue
+        else:
+            logger.warning("StatusInvest retornou HTTP %d para %s", response.status_code, ticker)
     except Exception as e:
-        pass
+        logger.warning("Erro ao buscar DY do StatusInvest para %s: %s", ticker, e)
+    logger.debug("DY não encontrado no StatusInvest para %s", ticker)
     return None
 
 def get_dy_12m_estimate(ticker):
@@ -204,12 +259,14 @@ def load_portfolio():
             return data
             
     except json.JSONDecodeError as e:
+        logger.error("portfolio.json corrompido: %s", e)
         st.error(f"⚠️ Erro ao ler portfolio.json: {str(e)}")
         st.info("🔄 Criando novo portfolio...")
         new_portfolio = {"positions": []}
         save_portfolio(new_portfolio)
         return new_portfolio
     except Exception as e:
+        logger.error("Erro inesperado ao carregar portfolio: %s", e)
         st.error(f"❌ Erro inesperado: {str(e)}")
         return {"positions": []}
 
@@ -228,6 +285,7 @@ def save_portfolio(data):
             json.dump(data, f, ensure_ascii=False, indent=2)
             
     except Exception as e:
+        logger.error("Erro ao salvar portfolio: %s", e)
         st.error(f"❌ Erro ao salvar portfolio: {str(e)}")
 
 def upsert_position(portfolio, ticker, quantity, buy_price):
@@ -455,6 +513,46 @@ def page_portfolio():
             "Valor de Mercado": "R$ {:.2f}",
             "Renda Mensal Estimada": "R$ {:.2f}"
         }), use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("📊 Alocação da Carteira")
+        col_pie, col_bar = st.columns(2)
+
+        with col_pie:
+            fig_pie = go.Figure(go.Pie(
+                labels=df["Ticker"],
+                values=df["Valor de Mercado"],
+                hole=0.4,
+                textinfo="label+percent",
+                hovertemplate="<b>%{label}</b><br>R$ %{value:,.2f}<br>%{percent}<extra></extra>",
+            ))
+            fig_pie.update_layout(
+                title="Participação por FII (%)",
+                showlegend=False,
+                height=380,
+                margin=dict(t=40, b=0, l=0, r=0),
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with col_bar:
+            df_sorted = df.sort_values("Valor de Mercado", ascending=True)
+            fig_bar = go.Figure(go.Bar(
+                x=df_sorted["Valor de Mercado"],
+                y=df_sorted["Ticker"],
+                orientation="h",
+                text=df_sorted["Valor de Mercado"].apply(lambda v: f"R$ {v:,.0f}"),
+                textposition="outside",
+                marker_color="royalblue",
+                hovertemplate="<b>%{y}</b><br>R$ %{x:,.2f}<extra></extra>",
+            ))
+            fig_bar.update_layout(
+                title="Valor de Mercado por FII (R$)",
+                xaxis=dict(title="R$"),
+                yaxis=dict(title=""),
+                height=380,
+                margin=dict(t=40, b=0, l=0, r=10),
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
     else:
         st.info("📭 Sua carteira está vazia. Adicione FIIs na aba 'Explorar FIIs'.")
 
