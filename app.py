@@ -40,6 +40,7 @@ client = Brapi(api_key=BRAPI_API_KEY)
 DATA_DIR = "data"
 IFIX_CSV = os.path.join(DATA_DIR, "ifix_tickers.csv")
 PORTFOLIO_JSON = os.path.join(DATA_DIR, "portfolio.json")
+PROVENTOS_JSON = os.path.join(DATA_DIR, "proventos.json")
 
 st.set_page_config(page_title="Dashboard FIIs IFIX", layout="wide")
 
@@ -257,6 +258,46 @@ def load_ifix_list():
 def save_ifix_list(df):
     """Salva lista de FIIs no CSV com preços e DY atualizados"""
     df.to_csv(IFIX_CSV, index=False, encoding='utf-8')
+
+# ============= FUNÇÕES DE PROVENTOS =============
+
+def load_proventos():
+    """Carrega histórico de proventos registrados manualmente"""
+    if not os.path.exists(PROVENTOS_JSON):
+        return []
+    try:
+        with open(PROVENTOS_JSON, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                return []
+            data = json.loads(content)
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.error("Erro ao carregar proventos: %s", e)
+        return []
+
+def save_proventos(proventos):
+    """Salva histórico de proventos"""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(PROVENTOS_JSON, "w", encoding="utf-8") as f:
+            json.dump(proventos, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("Erro ao salvar proventos: %s", e)
+        st.error(f"❌ Erro ao salvar proventos: {e}")
+
+def add_provento(ticker, data_pagamento, valor_por_cota, quantidade):
+    """Adiciona um registro de provento recebido"""
+    proventos = load_proventos()
+    proventos.append({
+        "ticker": ticker.upper(),
+        "data": data_pagamento,
+        "valor_por_cota": valor_por_cota,
+        "quantidade": quantidade,
+        "total": round(valor_por_cota * quantidade, 2),
+    })
+    proventos.sort(key=lambda x: x["data"], reverse=True)
+    save_proventos(proventos)
 
 def load_portfolio():
     """Carrega portfolio com tratamento de erros"""
@@ -518,10 +559,20 @@ def page_explore():
         else:
             st.error("❌ Informe um ticker válido.")
 
-def page_portfolio():
+def _highlight_dy(row, dy_min, dy_max):
+    """Aplica cor de fundo na linha conforme o DY."""
+    dy = row.get("DY 12m (%)", 0)
+    if dy > 0 and dy < dy_min:
+        return ["background-color: #ffe5e5"] * len(row)
+    if dy >= dy_max:
+        return ["background-color: #fff3cd"] * len(row)
+    return [""] * len(row)
+
+
+def page_portfolio(dy_min=6.0, dy_max=15.0):
     st.header("💼 Minha Carteira")
     portfolio = load_portfolio()
-    
+
     with st.spinner("Carregando dados da carteira..."):
         df, totals = calc_portfolio_metrics(portfolio)
 
@@ -531,14 +582,26 @@ def page_portfolio():
     col3.metric("📊 DY Médio", f"{totals['DY Médio (%)']:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
 
     if not df.empty:
-        st.dataframe(df.style.format({
+        # Alertas de DY
+        alertas_baixo = df[df["DY 12m (%)"].between(0.01, dy_min, inclusive="left")]
+        alertas_alto = df[df["DY 12m (%)"] >= dy_max]
+        if not alertas_baixo.empty:
+            tickers_baixo = ", ".join(alertas_baixo["Ticker"].tolist())
+            st.warning(f"⚠️ DY abaixo de {dy_min:.1f}%: **{tickers_baixo}**")
+        if not alertas_alto.empty:
+            tickers_alto = ", ".join(alertas_alto["Ticker"].tolist())
+            st.info(f"🟡 DY acima de {dy_max:.1f}% (atenção ao risco): **{tickers_alto}**")
+
+        styled = df.style.format({
             "PM": "R$ {:.2f}",
             "Preço Atual": "R$ {:.2f}",
             "Variação (%)": "{:.2f}%",
             "DY 12m (%)": "{:.2f}%",
             "Valor de Mercado": "R$ {:.2f}",
             "Renda Mensal Estimada": "R$ {:.2f}"
-        }), use_container_width=True)
+        }).apply(_highlight_dy, dy_min=dy_min, dy_max=dy_max, axis=1)
+        st.dataframe(styled, use_container_width=True)
+        st.caption(f"🔴 DY < {dy_min:.1f}%  |  🟡 DY ≥ {dy_max:.1f}%  (thresholds configuráveis na barra lateral)")
 
         st.markdown("---")
         st.subheader("📊 Alocação da Carteira")
@@ -654,6 +717,110 @@ def page_portfolio():
             file_name=f"carteira_fiis_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
         )
+
+        # ---- Resumo Fiscal ----
+        st.markdown("---")
+        st.subheader("🧾 Resumo Fiscal")
+        st.caption("FIIs são isentos de IR sobre dividendos para pessoas físicas. O IR incide apenas sobre ganho de capital na venda de cotas.")
+
+        df_fiscal = df[["Ticker", "Qtde", "PM", "Preço Atual", "Valor de Mercado"]].copy()
+        df_fiscal["Custo Total (R$)"] = df_fiscal["Qtde"] * df_fiscal["PM"]
+        df_fiscal["Ganho de Capital (R$)"] = df_fiscal["Valor de Mercado"] - df_fiscal["Custo Total (R$)"]
+        df_fiscal["Ganho (%)"] = (df_fiscal["Ganho de Capital (R$)"] / df_fiscal["Custo Total (R$)"]).where(
+            df_fiscal["Custo Total (R$)"] > 0, 0
+        ) * 100
+        df_fiscal["IR estimado (20%)"] = df_fiscal["Ganho de Capital (R$)"].apply(lambda x: x * 0.20 if x > 0 else 0.0)
+
+        total_custo = df_fiscal["Custo Total (R$)"].sum()
+        total_ganho = df_fiscal["Ganho de Capital (R$)"].sum()
+        total_ir = df_fiscal["IR estimado (20%)"].sum()
+
+        col_f1, col_f2, col_f3 = st.columns(3)
+        col_f1.metric("💸 Custo total", f"R$ {total_custo:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        sinal = "+" if total_ganho >= 0 else ""
+        col_f2.metric("📈 Ganho de capital latente", f"{sinal}R$ {total_ganho:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        col_f3.metric("🏦 IR latente (20% sobre ganho)", f"R$ {total_ir:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+        st.dataframe(df_fiscal.drop(columns=["PM", "Preço Atual", "Valor de Mercado"]).style.format({
+            "Custo Total (R$)": "R$ {:.2f}",
+            "Ganho de Capital (R$)": "R$ {:.2f}",
+            "Ganho (%)": "{:.2f}%",
+            "IR estimado (20%)": "R$ {:.2f}",
+        }).applymap(lambda v: "color: green" if isinstance(v, (int, float)) and v > 0 else (
+            "color: red" if isinstance(v, (int, float)) and v < 0 else ""
+        ), subset=["Ganho de Capital (R$)", "Ganho (%)"]), use_container_width=True)
+
+        # ---- Histórico de Proventos ----
+        st.markdown("---")
+        st.subheader("💰 Histórico de Proventos Recebidos")
+
+        proventos = load_proventos()
+
+        with st.expander("➕ Registrar novo provento", expanded=False):
+            tickers_carteira = df["Ticker"].tolist()
+            col_p1, col_p2, col_p3, col_p4 = st.columns(4)
+            with col_p1:
+                p_ticker = st.selectbox("Ticker", tickers_carteira, key="p_ticker")
+            with col_p2:
+                p_data = st.date_input("Data de pagamento", key="p_data")
+            with col_p3:
+                p_valor = st.number_input("Valor por cota (R$)", min_value=0.0, value=0.0, step=0.01, format="%.4f", key="p_valor")
+            with col_p4:
+                p_qtd_default = int(df[df["Ticker"] == p_ticker]["Qtde"].values[0]) if p_ticker in df["Ticker"].values else 1
+                p_qtd = st.number_input("Quantidade de cotas", min_value=1, value=p_qtd_default, step=1, key="p_qtd")
+            if st.button("💾 Salvar provento"):
+                if p_valor > 0:
+                    add_provento(p_ticker, str(p_data), p_valor, p_qtd)
+                    st.success(f"✅ Provento de R$ {p_valor * p_qtd:.2f} registrado para {p_ticker}!")
+                    st.rerun()
+                else:
+                    st.error("❌ Informe um valor por cota maior que zero.")
+
+        if proventos:
+            df_prov = pd.DataFrame(proventos)
+            df_prov = df_prov.rename(columns={
+                "ticker": "Ticker", "data": "Data", "valor_por_cota": "R$/Cota",
+                "quantidade": "Qtde", "total": "Total (R$)"
+            })
+            total_proventos = df_prov["Total (R$)"].sum()
+            st.metric("💵 Total recebido em proventos", f"R$ {total_proventos:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+            # Gráfico de proventos por mês
+            df_prov["Mês"] = pd.to_datetime(df_prov["Data"]).dt.to_period("M").astype(str)
+            df_mensal = df_prov.groupby("Mês")["Total (R$)"].sum().reset_index().sort_values("Mês")
+            fig_prov = go.Figure(go.Bar(
+                x=df_mensal["Mês"],
+                y=df_mensal["Total (R$)"],
+                marker_color="seagreen",
+                text=df_mensal["Total (R$)"].apply(lambda v: f"R$ {v:,.2f}"),
+                textposition="outside",
+                hovertemplate="<b>%{x}</b><br>R$ %{y:,.2f}<extra></extra>",
+            ))
+            fig_prov.update_layout(
+                title="Proventos recebidos por mês (R$)",
+                xaxis=dict(title="Mês"),
+                yaxis=dict(title="R$"),
+                height=300,
+                margin=dict(t=40, b=0, l=0, r=0),
+            )
+            st.plotly_chart(fig_prov, use_container_width=True)
+
+            st.dataframe(df_prov.style.format({
+                "R$/Cota": "R$ {:.4f}",
+                "Total (R$)": "R$ {:.2f}",
+            }), use_container_width=True)
+
+            # Exportar proventos
+            csv_prov = df_prov.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                label="📥 Baixar proventos em CSV",
+                data=csv_prov,
+                file_name=f"proventos_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key="dl_proventos",
+            )
+        else:
+            st.info("📭 Nenhum provento registrado ainda. Use o formulário acima para registrar.")
 
     else:
         st.info("📭 Sua carteira está vazia. Adicione FIIs na aba 'Explorar FIIs'.")
@@ -860,12 +1027,23 @@ def main():
     st.sidebar.title("📊 Dashboard FIIs IFIX")
     st.sidebar.markdown("---")
     page = st.sidebar.radio("🧭 Navegação", ["🔍 Explorar FIIs", "💼 Minha Carteira", "🎯 Projeções"])
-    
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔔 Alertas de DY")
+    dy_min = st.sidebar.number_input(
+        "DY mínimo (%)", min_value=0.0, max_value=50.0, value=6.0, step=0.5, format="%.1f",
+        help="FIIs abaixo deste DY serão destacados em vermelho na carteira"
+    )
+    dy_max = st.sidebar.number_input(
+        "DY máximo (%)", min_value=0.0, max_value=100.0, value=15.0, step=0.5, format="%.1f",
+        help="FIIs acima deste DY serão destacados em laranja (possível sinal de risco)"
+    )
+
     st.sidebar.markdown("---")
     st.sidebar.success("✅ **Conectado à Brapi**")
     st.sidebar.info("💡 **Preços:** Brapi")
     st.sidebar.info("📊 **DY:** Funds Explorer + Status Invest")
-    
+
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📚 Sobre")
     st.sidebar.markdown("Dashboard para controle de investimentos em FIIs brasileiros.")
@@ -876,7 +1054,7 @@ def main():
     if page == "🔍 Explorar FIIs":
         page_explore()
     elif page == "💼 Minha Carteira":
-        page_portfolio()
+        page_portfolio(dy_min=dy_min, dy_max=dy_max)
     else:
         page_projection()
 
